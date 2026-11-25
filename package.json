@@ -1,6 +1,6 @@
 {
   "name": "cliproxy-personal-quota",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Мои квоты — панель OpenCode Desktop для CLIProxyAPI",
@@ -13,7 +13,7 @@
     "./gui-experimental": "./dist/gui-experimental.cjs"
   },
   "scripts": {
-    "build": "vite build && tsc -p tsconfig.server.json",
+    "bundle": "vite build && tsc -p tsconfig.server.json",
     "watch": "vite build --watch",
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts"

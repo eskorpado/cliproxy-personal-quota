@@ -13,5 +13,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check && npm test
-      - run: rm -r dist && npm run build && git diff --exit-code -- dist && test -z "$(git ls-files --others --exclude-standard dist)"
+      - run: rm -r dist && npm run bundle && git diff --exit-code -- dist && test -z "$(git ls-files --others --exclude-standard dist)"
       - run: npm pack --dry-run
