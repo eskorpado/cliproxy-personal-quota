@@ -12,7 +12,7 @@ test("Личный остаток зависит от доли; превышен
   assert.equal(codex("over").detail, undefined)
 })
 
-test("Индикатор не суммирует бюджеты и не подменяет пропуски процентами", () => {
+test("Индикатор отличает верхнюю границу остатка от полного результата и отсутствия данных", () => {
   const normal = demoSnapshot("normal")
   assert.equal(normal.pools.flatMap(p => p.windows).length, 5)
   assert.equal(indicator(normal, "gpt-image")?.label, "GPT · 7 дней: ≈70% · демо")
@@ -24,8 +24,12 @@ test("Индикатор не суммирует бюджеты и не подм
   assert.equal(week.pct, null)
   assert.equal(windowLabel(week), "Нет данных")
   const partial = demoSnapshot("partial")
-  assert.equal(partial.pools[1].windows[0].pct, null)
-  assert.match(indicator(partial, "kimi-k3")!.label, /KIMI · 5 часов: неполно/)
+  const partialWindow = partial.pools[1].windows[0]
+  assert.equal(windowLabel(partialWindow), "Осталось не более 80%")
+  assert.equal(windowLabel({ ...partialWindow, pct: null }), "Часть расхода не оценена")
+  assert.equal(windowLabel({ ...partialWindow, pct: 80.01 }), "Осталось не более 81%")
+  assert.match(indicator(partial, "kimi-k3")!.label, /KIMI · 5 часов: ≤80%/)
+  assert.equal(indicator(partial, "kimi-k3")?.tone, "warning")
   assert.equal(indicator(demoSnapshot("over"), "gpt-astra")?.tone, "danger")
   assert.equal(indicator(demoSnapshot("over"), "glm")?.tone, "success")
   assert.equal(indicator(demoSnapshot("low"), "gpt-astra")?.tone, "warning")

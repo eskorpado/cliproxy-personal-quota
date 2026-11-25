@@ -57,27 +57,17 @@ function equal(a, b) {
         return other && other.requests === row.requests && Math.abs(other.cost - row.cost) <= 1e-8 * Math.max(1, row.cost);
     });
 }
-function unmeteredFailure(event, cost) {
-    // CPA can record zero when a failed attempt reported no usage. Exclude it from
-    // the estimate, not from reconciliation; this doesn't establish upstream spend.
-    return event.failed === true && cost.total === 0 &&
-        [event.accounting_quality, event.response_service_tier, event.effective_service_tier].every(v => v == null || v === "") &&
-        [event.ttft_ms, event.reasoning_tokens, cost.uncached_input_tokens, cost.cache_read_tokens, cost.cache_write_tokens,
-            cost.billed_output_tokens, cost.cache_write_5m_tokens, cost.cache_write_1h_tokens, cost.image_input_tokens,
-            cost.image_cache_read_tokens, cost.image_output_tokens, cost.uncached_input, cost.cache_read, cost.cache_write,
-            cost.output, cost.cache_write_1h, cost.image_input, cost.image_cache_read, cost.image_output].every(v => v == null || v === 0);
-}
 export function eventSpend(event, model, at, meter) {
     const cost = record(event.cost);
-    if (!meter.models.has(model) || !cost || cost.currency !== "USD" || !nonnegative(cost.total) || cost.tiered)
+    // Require positive evidence of comparable billing, not a guess based on
+    // the request outcome, latency or an unverified zero reported by CPA.
+    if (!meter.models.has(model) || event.accounting_quality !== "complete" || event.price_source !== "custom" ||
+        !cost || cost.currency !== "USD" || !nonnegative(cost.total) || !Number.isFinite(at))
         return;
-    const multiplier = cost.multiplier ?? 1;
-    if (multiplier !== 0 && multiplier !== 1)
-        return;
-    if (unmeteredFailure(event, cost))
-        return 0;
-    if (event.accounting_quality !== "complete" || event.price_source !== "custom" ||
-        [cost.image_input_tokens, cost.image_cache_read_tokens, cost.image_output_tokens].some(n => n != null && n !== 0))
+    if ([cost.tiered, cost.long_context].some(flag => flag !== undefined && flag !== false) ||
+        (cost.multiplier !== undefined && cost.multiplier !== 0 && cost.multiplier !== 1) ||
+        [cost.image_input_tokens, cost.image_cache_read_tokens, cost.image_output_tokens,
+            cost.image_input, cost.image_cache_read, cost.image_output].some(n => n != null && n !== 0))
         return;
     let factor = 1;
     if (meter.tiers) {
@@ -90,7 +80,8 @@ export function eventSpend(event, model, at, meter) {
                 return "priority";
         };
         // Response tier is the executed tier; otherwise use final outbound, never the requested tier.
-        const executed = tier(event.response_service_tier || event.effective_service_tier);
+        const reported = event.response_service_tier;
+        const executed = tier(reported == null || reported === "" ? event.effective_service_tier : reported);
         if (executed === "standard")
             factor = meter.tiers.standard;
         else if (executed === "priority") {
@@ -114,7 +105,7 @@ const MAX_EVENTS = 10_000;
 async function spend(api, index, interval, meter) {
     // At the exact cycle boundary [from, to) is empty; CPA needs a nonempty range.
     if (interval.from === interval.to)
-        return 0;
+        return { used: 0, skipped: 0 };
     const range = { from: new Date(interval.from).toISOString(), to: new Date(interval.to).toISOString() };
     const query = { ...range, auth_index: index };
     const expected = await usage(api, query);
@@ -125,8 +116,8 @@ async function spend(api, index, interval, meter) {
         interval.from < interval.to - (coverage?.retentionDays ?? 7) * DAY)
         return "coverage";
     if (!expected.size)
-        return 0;
-    if ([...expected].some(([model]) => !meter.models.has(model)) || [...expected.values()].reduce((n, row) => n + row.requests, 0) > MAX_EVENTS)
+        return { used: 0, skipped: 0 };
+    if ([...expected.values()].reduce((n, row) => n + row.requests, 0) > MAX_EVENTS)
         return;
     const head = data(await api("/events", { ...range, limit: "1" }));
     const snapshot = head.snapshot_id;
@@ -134,7 +125,7 @@ async function spend(api, index, interval, meter) {
     if (typeof snapshot !== "string" || !/^\d{1,19}$/.test(snapshot) || !Array.isArray(options) || options.length > 64)
         return;
     const ids = new Set(), matched = new Map(), credentials = new Set();
-    let total = 0;
+    let total = 0, skipped = 0;
     for (const raw of options) {
         const option = record(raw), token = option?.value;
         if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token) || credentials.has(token))
@@ -169,11 +160,14 @@ async function spend(api, index, interval, meter) {
                 const at = utc(event.at), model = event.billing_model || event.upstream_model, cost = record(event.cost);
                 if (!(at >= interval.from && at < interval.to) || typeof model !== "string" || !cost || !nonnegative(cost.total))
                     return;
+                // Reconcile every event against the account, even if its cost cannot
+                // be used in the estimate. No result is published until both checks pass.
+                merge(seen, model, 1, cost.total);
                 const adjusted = eventSpend(event, model, at, meter);
                 if (adjusted === undefined)
-                    return;
-                merge(seen, model, 1, cost.total);
-                total += adjusted;
+                    skipped++;
+                else
+                    total += adjusted;
             }
         }
         if (!equal(intersection, seen))
@@ -181,7 +175,9 @@ async function spend(api, index, interval, meter) {
         for (const [model, row] of seen)
             merge(matched, model, row.requests, row.cost);
     }
-    return equal(expected, matched) && Number.isFinite(total) ? total : undefined;
+    if (!equal(expected, matched) || !Number.isFinite(total))
+        return;
+    return { used: skipped === ids.size ? null : total, skipped };
 }
 function staleWindow(previous, index, share, now, end) {
     if (previous && previous.index === index && previous.share === share && previous.end > now && (end === undefined || end === previous.end))
@@ -259,10 +255,16 @@ export async function measure(api, policy, now, previous) {
                 continue;
             }
             try {
-                const used = await spend(api, account.index, interval, pool.meter);
-                if (typeof used !== "number") {
-                    windows.push(withReset(unavailable(w, used === "coverage" ? "Не подтверждено, что журнал CPA покрывает всё окно." :
-                        "Не удалось подтвердить сопоставимость начислений или их привязку к аккаунту.", "partial")));
+                const estimate = await spend(api, account.index, interval, pool.meter);
+                if (estimate === undefined || estimate === "coverage") {
+                    windows.push(withReset(unavailable(w, estimate === "coverage" ? "Не подтверждено, что журнал CPA покрывает всё окно." :
+                        "Не удалось сверить журнал начислений с данными аккаунта.", "partial")));
+                    continue;
+                }
+                const { used, skipped } = estimate;
+                const skippedNote = `Не учтено запросов: ${skipped}.`;
+                if (used === null) {
+                    windows.push(withReset(unavailable(w, `${skippedNote} Нет подтверждённых начислений.`, "partial")));
                     continue;
                 }
                 const budget = w.capacity * share / 100;
@@ -270,8 +272,10 @@ export async function measure(api, policy, now, previous) {
                     windows.push(withReset(unavailable(w, "Не удалось определить личный бюджет.")));
                     continue;
                 }
+                const status = used > budget ? "over" : skipped ? "partial" : "ok";
                 const window = withReset({
-                    title: w.title, status: used > budget ? "over" : "ok", pct: Math.max(0, 1 - used / budget) * 100,
+                    title: w.title, status, pct: Math.max(0, 1 - used / budget) * 100,
+                    ...(skipped ? { detail: skippedNote } : {}),
                     validUntil: interval.end ?? now + 6 * MINUTE,
                 });
                 windows.push(window);

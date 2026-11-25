@@ -1,6 +1,7 @@
 export type QuotaWindow = {
   title: string
   status: "ok" | "over" | "partial" | "missing"
+  // For a partial estimate this is an upper bound, not the expected remainder.
   pct: number | null
   detail?: string
   resetAt?: number

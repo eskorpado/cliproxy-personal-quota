@@ -94,6 +94,7 @@ function stub() {
     catalog: (v: unknown, code = 200) => { catalogue = v; catalogCode = code },
     identity: (v: Identity) => { identity = v; if ("key" in v) expectedKey = v.key },
     count: (n: number) => { credentialCount = n },
+    journal: (v: EventFixture[]) => { entries = v },
     events: (v: EventFixture[]) => {
       entries = v; credentialCount = v.length
       const totals = new Map<string, typeof rows[number]>()
@@ -238,39 +239,74 @@ test("per-event adjustments use actual tier and time, not guesses or already adj
   assert.equal(eventSpend(baseEvent, "glm-5.4", Date.parse("2026-11-25T10:00:00Z"), zai), 1.5)
 })
 
-test("only unmetered failures with no recorded usage can bypass accounting and tier checks", () => {
+test("only comparable billing is accepted regardless of request outcome or telemetry", () => {
   const codex = parsePolicy(example).pools[0].meter
   assert.equal(codex.source, "cpa.cost")
-  const spend = (event: Record<string, unknown>, billedModel = failedEvent.billing_model) => eventSpend(event, billedModel, at, codex)
-  assert.equal(spend(failedEvent), 0)
-  assert.equal(spend({ ...failedEvent, effective_service_tier: undefined, price_source: "none" }), 0)
-  assert.equal(spend({ ...baseEvent, failed: true }, model), 6)
-  assert.equal(spend(failedEvent, "unknown-model"), undefined)
-  for (const changes of [
-    { failed: false }, { failed: undefined }, { accounting_quality: "complete" }, { accounting_quality: "inconsistent" },
-    { response_service_tier: "default" }, { effective_service_tier: "priority" }, { ttft_ms: 1 }, { reasoning_tokens: 1 },
-    { cost: { ...failedEvent.cost, total: 0.01 } }, { cost: { ...failedEvent.cost, billed_output_tokens: 1 } },
-    { cost: { ...failedEvent.cost, cache_read_tokens: 1 } }, { cost: { ...failedEvent.cost, cache_write_1h_tokens: 1 } },
-    { cost: { ...failedEvent.cost, image_input_tokens: 1 } }, { cost: { ...failedEvent.cost, output: 0.01 } },
-  ]) assert.equal(spend({ ...failedEvent, ...changes }), undefined, JSON.stringify(changes))
+  const spend = (event: EventFixture) => eventSpend(event, event.billing_model, at, codex)
+  assert.equal(spend({ ...baseEvent, failed: true, ttft_ms: 907 }), 6)
+  assert.equal(spend({ ...baseEvent, cost: { ...baseEvent.cost, total: 0, multiplier: 0, tiered: false } }), 0)
+  for (const event of [
+    failedEvent, { ...failedEvent, ttft_ms: 907 }, { ...failedEvent, failed: false },
+    { ...baseEvent, accounting_quality: "inconsistent" }, { ...baseEvent, price_source: "none" },
+    { ...baseEvent, billing_model: "gpt-image-2.6" }, { ...baseEvent, response_service_tier: "unknown" },
+    { ...baseEvent, response_service_tier: false }, { ...baseEvent, cost: { ...baseEvent.cost, currency: "EUR" } },
+    { ...baseEvent, cost: { ...baseEvent.cost, tiered: true } }, { ...baseEvent, cost: { ...baseEvent.cost, long_context: true } },
+    { ...baseEvent, cost: { ...baseEvent.cost, image_output: 0.01 } },
+  ]) assert.equal(spend(event), undefined, JSON.stringify(event))
 })
 
-test("a GPT stream failure without accounting does not hide the remaining quota or bypass reconciliation", async () => {
+test("a GPT stream failure with TTFT leaves a partial estimate, not a free request", async () => {
   const s = stub()
-  s.events([baseEvent, failedEvent])
+  s.events([baseEvent, { ...failedEvent, ttft_ms: 907 }])
   const window = (await s.snapshot()).pools[0].windows[0]
-  assert.equal(window.status, "ok")
+  assert.equal(window.status, "partial")
   assert.equal(window.pct, 70)
+  assert.equal(window.detail, "Не учтено запросов: 1.")
   assert.equal(window.resetAt, at + hour)
+  assert.equal(currentView({ pools: [{ modelFamilyPrefix: "gpt", windows: [window] }], asOf: at }, at + hour).pools[0].windows[0].pct, null)
+})
 
-  s.events([baseEvent, { ...failedEvent, failed: false }])
-  const unknown = (await s.snapshot()).pools[0].windows[0]
-  assert.equal(unknown.status, "partial")
-  assert.equal(unknown.pct, null)
+test("unknown models and incompatible positive costs are skipped without losing comparable spend", async () => {
+  const s = stub()
+  const image = { ...baseEvent, id: "79", billing_model: "gpt-image-2.6", cost: { ...baseEvent.cost, total: 9 } }
+  const unknownTier = { ...baseEvent, id: "80", response_service_tier: "unknown" }
+  const window = async () => (await s.snapshot()).pools[0].windows[0]
+  s.events([baseEvent, image, unknownTier, failedEvent])
+  assert.deepEqual(await window(), {
+    title: "7 дней", status: "partial", pct: 70, detail: "Не учтено запросов: 3.", resetAt: at + hour, validUntil: at + hour,
+  })
+  s.events([image, unknownTier])
+  const allSkipped = await window()
+  assert.equal(allSkipped.status, "partial")
+  assert.equal(allSkipped.pct, null)
+  assert.match(allSkipped.detail!, /Не учтено запросов: 2/)
+  s.events([{ ...baseEvent, cost: { ...baseEvent.cost, total: 11 } }, image])
+  const over = await window()
+  assert.equal(over.status, "over")
+  assert.equal(over.pct, 0)
+  assert.equal(over.detail, "Не учтено запросов: 1.")
+})
 
-  s.events([baseEvent, failedEvent])
+test("even skipped events must reconcile by count, cost, identity and window", async () => {
+  const s = stub()
+  const image = { ...baseEvent, id: "79", billing_model: "gpt-image-2.6", cost: { ...baseEvent.cost, total: 9 } }
+  s.events([baseEvent, image])
+  const assertUnreconciled = async () => {
+    const w = (await s.snapshot()).pools[0].windows[0]
+    assert.equal(w.status, "partial")
+    assert.equal(w.pct, null)
+    assert.match(w.detail!, /Не удалось сверить журнал/)
+  }
   s.count(1)
-  assert.equal((await s.snapshot()).pools[0].windows[0].status, "partial")
+  await assertUnreconciled()
+  s.count(2)
+  for (const invalid of [
+    { ...image, cost: { ...image.cost, total: 8 } }, { ...image, id: baseEvent.id },
+    { ...image, at: new Date(at).toISOString() }, { ...image, billing_model: "another-model" },
+  ]) {
+    s.journal([baseEvent, invalid])
+    await assertUnreconciled()
+  }
 })
 
 test("snapshots apply allocation changes without resetting spend and disclose only display fields", async () => {
@@ -286,11 +322,15 @@ test("snapshots apply allocation changes without resetting spend and disclose on
 
 test("event pages are pinned; account collisions and coverage gaps don't invent a percentage", async () => {
   const s = stub()
-  s.events(Array.from({ length: 255 }, (_, i) => ({ ...baseEvent, id: String(i + 1) })))
-  assert.equal((await s.snapshot()).pools[0].windows[0].status, "over")
+  s.events(Array.from({ length: 255 }, (_, i) => ({ ...(i === 249 || i === 250 ? failedEvent : baseEvent), id: String(i + 1) })))
+  const paged = (await s.snapshot()).pools[0].windows[0]
+  assert.equal(paged.status, "over")
+  assert.equal(paged.detail, "Не учтено запросов: 2.")
   assert.deepEqual(s.calls.filter(c => c.query.has("credential")).map(c => c.query.get("offset")), ["0", "250"])
   s.count(256)
-  assert.equal((await s.snapshot()).pools[0].windows[0].status, "partial")
+  const mismatch = (await s.snapshot()).pools[0].windows[0]
+  assert.equal(mismatch.status, "partial")
+  assert.equal(mismatch.pct, null)
   s.empty()
   assert.equal((await s.snapshot()).pools[0].windows[0].pct, 100)
   s.catalog(codexPolicy({ fromUtc: "2026-11-25T00:00:00Z" }))

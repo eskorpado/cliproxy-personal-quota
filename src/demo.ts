@@ -47,7 +47,7 @@ export function demoSnapshot(scenario: Scenario, readAt = new Date()) {
           : w.id === "short" ? 65 : (pool.id === "demo-glm" ? 6 : 4) * 1440 + 60) * 60_000,
       }
       if (scenario === "partial" && pool.id === "demo-kimi")
-        return { title: w.title, status: "partial", pct: null, detail: "В журнале есть вызовы без сопоставимой цены.", ...reset }
+        return { title: w.title, status: "partial", pct: Math.max(0, 1 - used / budget) * 100, detail: "Не учтено запросов: 1.", ...reset }
       const over = used > budget
       return {
         title: w.title, status: over ? "over" : "ok", pct: Math.max(0, 1 - used / budget) * 100, ...reset,
@@ -63,7 +63,7 @@ export type Snapshot = ReturnType<typeof demoSnapshot>
 export function windowLabel(w: QuotaWindow) {
   if (w.status === "over") return "0% · превышена"
   if (w.status === "missing") return "Нет данных"
-  if (w.status === "partial") return "Часть расхода не оценена"
+  if (w.status === "partial") return w.pct === null ? "Часть расхода не оценена" : `Осталось не более ${Math.ceil(w.pct)}%`
   return `≈${Math.round(w.pct!)}% осталось`
 }
 
@@ -82,13 +82,13 @@ export function indicator(data: Snapshot | LiveSnapshot, family?: string) {
   const asOf = demo ? data.asOf : data.asOf !== null ? new Date(data.asOf) : undefined
   const prefix = pool.modelFamilyPrefix.toUpperCase()
   const parts = pool.windows.map(w => {
-    const value = w.status === "over" ? "0% · превышена" : w.status === "partial" ? "неполно" : w.pct === null ? "нет данных" : `≈${Math.round(w.pct)}%`
+    const value = w.status === "over" ? "0% · превышена" : w.status === "partial" ? w.pct === null ? "неполно" : `≤${Math.ceil(w.pct)}%` : w.pct === null ? "нет данных" : `≈${Math.round(w.pct)}%`
     return `${w.title}: ${value}`
   })
-  const tone = stale || (!demo && data.issue) ? "warning" : pool.windows.some(w => w.status === "over") ? "danger" : pool.windows.some(w => w.pct === null || w.pct <= 25) ? "warning" : "success"
+  const tone = stale || (!demo && data.issue) ? "warning" : pool.windows.some(w => w.status === "over") ? "danger" : pool.windows.some(w => w.status === "partial" || w.pct === null || w.pct <= 25) ? "warning" : "success"
   return {
     label: [prefix, ...parts, ...(stale ? ["устарело"] : []), ...(demo ? ["демо"] : [])].join(" · "),
-    title: `${prefix} — остаток квоты.${asOf ? ` Снимок: ${formatTime(asOf)}.` : ""}${stale ? " Есть устаревшие окна." : ""}${demo ? " Демоданные" : ""}`,
+    title: `${prefix} — остаток квоты.${asOf ? ` Снимок: ${formatTime(asOf)}.` : ""}${stale ? " Есть устаревшие окна." : ""}${pool.windows.some(w => w.status === "partial") ? " Есть неполные данные." : ""}${demo ? " Демоданные" : ""}`,
     tone: tone as "success" | "warning" | "danger",
   }
 }
