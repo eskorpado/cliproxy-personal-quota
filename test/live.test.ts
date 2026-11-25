@@ -11,7 +11,6 @@ import { currentView } from "../src/view.ts"
 const at = Date.parse("2026-11-25T12:00:00Z")
 const hour = 3_600_000
 const origin = "https://cpa.example.org"
-// Construct the recurring cycles relative to the test clock; no deployment data.
 const anchors = [[at + 2 * hour], [at + 4 * hour, at + 98 * hour], [null, at + 138 * hour]]
 const anchoredExample = { ...example, pools: example.pools.map((pool, i) => ({ ...pool,
   windows: pool.windows.map((window, j) => ({ ...window, boundary: anchors[i][j] === null ? window.boundary : {
@@ -27,6 +26,13 @@ const baseEvent = {
   id: "77", at: "2026-11-25T09:00:00Z", billing_model: model, accounting_quality: "complete", price_source: "custom",
   effective_service_tier: "priority", cost: { currency: "USD", total: 3 },
 }
+const failedEvent = {
+  id: "78", at: "2026-11-25T10:00:00Z", billing_model: "gpt-6-astra", failed: true, stream: true,
+  effective_service_tier: "", service_tier: "priority", price_source: "custom",
+  error_body: "upstream stream closed before first payload",
+  cost: { currency: "USD", total: 0, uncached_input_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, billed_output_tokens: 0 },
+}
+type EventFixture = Record<string, unknown> & { billing_model: string; cost: { total: number } }
 
 function codexPolicy(coverage?: { fromUtc?: string; retentionDays?: number }) {
   const pool = example.pools[0], window = pool.windows[0]
@@ -39,7 +45,7 @@ function codexPolicy(coverage?: { fromUtc?: string; retentionDays?: number }) {
 function stub() {
   let now = at, label = "test user quota=20", expectedKey = fixtureKey, files = [account]
   let usageCode = 200, profileCode = 200, inventoryCode = 200, catalogCode = 200
-  let rows = [{ model, requests: 1, cost_usd: 3 }], entries = [baseEvent], credentialCount = 1
+  let rows = [{ model, requests: 1, cost_usd: 3 }], entries: EventFixture[] = [baseEvent], credentialCount = 1
   let catalogue: unknown = codexPolicy()
   const reset = at + hour
   const calls: { path: string; query: URLSearchParams; etag: string | null }[] = []
@@ -88,7 +94,18 @@ function stub() {
     catalog: (v: unknown, code = 200) => { catalogue = v; catalogCode = code },
     identity: (v: Identity) => { identity = v; if ("key" in v) expectedKey = v.key },
     count: (n: number) => { credentialCount = n },
-    events: (v: typeof entries) => { entries = v; credentialCount = v.length; rows = [{ model, requests: v.length, cost_usd: 3 * v.length }] },
+    events: (v: EventFixture[]) => {
+      entries = v; credentialCount = v.length
+      const totals = new Map<string, typeof rows[number]>()
+      for (const event of v) {
+        const model = event.billing_model
+        const row = totals.get(model) ?? { model, requests: 0, cost_usd: 0 }
+        row.requests++
+        row.cost_usd += event.cost.total
+        totals.set(model, row)
+      }
+      rows = [...totals.values()]
+    },
     empty: () => { rows = []; entries = []; credentialCount = 0 },
   }
 }
@@ -125,7 +142,7 @@ test("rolling, anchored and unknown boundaries remain independent", () => {
 test("an anchored weekly reset repeats independently of the rolling window", () => {
   const zai = parsePolicy(anchoredExample).pools.find(p => p.id === "demo-glm")!
   const [short, week] = zai.windows
-  const reset = at + 138 * hour
+  const reset = anchors[2][1]!
   const prior = reset - 168 * hour, next = reset + 168 * hour
   assert.deepEqual(windowInterval(week, at), { from: prior, to: at, end: reset })
   assert.deepEqual(windowInterval(week, reset), { from: reset, to: reset, end: next })
@@ -135,7 +152,7 @@ test("an anchored weekly reset repeats independently of the rolling window", () 
 test("Codex and both Kimi windows roll over independently from their catalog anchors", async () => {
   const p = parsePolicy(anchoredExample)
   const [codex, kimi] = p.pools
-  const gpt = at + 2 * hour, short = at + 4 * hour, week = at + 98 * hour
+  const [[gpt], [short, week]] = anchors as number[][]
   assert.equal(windowInterval(codex.windows[0], at)?.end, gpt)
   assert.deepEqual(windowInterval(codex.windows[0], gpt), { from: gpt, to: gpt, end: gpt + 168 * hour })
   assert.equal(windowInterval(kimi.windows[0], short - 5 * hour - 1)?.end, short - 5 * hour)
@@ -173,7 +190,7 @@ test("only scheduled windows have a reset date, independent of usage availabilit
       default: assert.fail(`Unexpected route ${route}`)
     }
   }, p, now)
-  const kimiReset = at + 4 * hour, zaiReset = at + 138 * hour
+  const kimiReset = anchors[1][0]!, zaiReset = anchors[2][1]!
   const { view } = await read(kimiReset - 6 * hour)
   const [, kimi, zai] = view.pools
   assert.equal(kimi.windows[0].status, "ok")
@@ -219,6 +236,41 @@ test("per-event adjustments use actual tier and time, not guesses or already adj
   assert.equal(eventSpend({ ...baseEvent, price_source: "reference" }, model, at, codex), undefined)
   assert.equal(eventSpend(baseEvent, "glm-5.4", Date.parse("2026-11-25T06:00:00Z"), zai), 3)
   assert.equal(eventSpend(baseEvent, "glm-5.4", Date.parse("2026-11-25T10:00:00Z"), zai), 1.5)
+})
+
+test("only unmetered failures with no recorded usage can bypass accounting and tier checks", () => {
+  const codex = parsePolicy(example).pools[0].meter
+  assert.equal(codex.source, "cpa.cost")
+  const spend = (event: Record<string, unknown>, billedModel = failedEvent.billing_model) => eventSpend(event, billedModel, at, codex)
+  assert.equal(spend(failedEvent), 0)
+  assert.equal(spend({ ...failedEvent, effective_service_tier: undefined, price_source: "none" }), 0)
+  assert.equal(spend({ ...baseEvent, failed: true }, model), 6)
+  assert.equal(spend(failedEvent, "unknown-model"), undefined)
+  for (const changes of [
+    { failed: false }, { failed: undefined }, { accounting_quality: "complete" }, { accounting_quality: "inconsistent" },
+    { response_service_tier: "default" }, { effective_service_tier: "priority" }, { ttft_ms: 1 }, { reasoning_tokens: 1 },
+    { cost: { ...failedEvent.cost, total: 0.01 } }, { cost: { ...failedEvent.cost, billed_output_tokens: 1 } },
+    { cost: { ...failedEvent.cost, cache_read_tokens: 1 } }, { cost: { ...failedEvent.cost, cache_write_1h_tokens: 1 } },
+    { cost: { ...failedEvent.cost, image_input_tokens: 1 } }, { cost: { ...failedEvent.cost, output: 0.01 } },
+  ]) assert.equal(spend({ ...failedEvent, ...changes }), undefined, JSON.stringify(changes))
+})
+
+test("a GPT stream failure without accounting does not hide the remaining quota or bypass reconciliation", async () => {
+  const s = stub()
+  s.events([baseEvent, failedEvent])
+  const window = (await s.snapshot()).pools[0].windows[0]
+  assert.equal(window.status, "ok")
+  assert.equal(window.pct, 70)
+  assert.equal(window.resetAt, at + hour)
+
+  s.events([baseEvent, { ...failedEvent, failed: false }])
+  const unknown = (await s.snapshot()).pools[0].windows[0]
+  assert.equal(unknown.status, "partial")
+  assert.equal(unknown.pct, null)
+
+  s.events([baseEvent, failedEvent])
+  s.count(1)
+  assert.equal((await s.snapshot()).pools[0].windows[0].status, "partial")
 })
 
 test("snapshots apply allocation changes without resetting spend and disclose only display fields", async () => {

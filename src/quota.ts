@@ -67,13 +67,25 @@ function equal(a: Totals, b: Totals) {
   })
 }
 
+function unmeteredFailure(event: Record<string, unknown>, cost: Record<string, unknown>) {
+  // CPA can record zero when a failed attempt reported no usage. Exclude it from
+  // the estimate, not from reconciliation; this doesn't establish upstream spend.
+  return event.failed === true && cost.total === 0 &&
+    [event.accounting_quality, event.response_service_tier, event.effective_service_tier].every(v => v == null || v === "") &&
+    [event.ttft_ms, event.reasoning_tokens, cost.uncached_input_tokens, cost.cache_read_tokens, cost.cache_write_tokens,
+      cost.billed_output_tokens, cost.cache_write_5m_tokens, cost.cache_write_1h_tokens, cost.image_input_tokens,
+      cost.image_cache_read_tokens, cost.image_output_tokens, cost.uncached_input, cost.cache_read, cost.cache_write,
+      cost.output, cost.cache_write_1h, cost.image_input, cost.image_cache_read, cost.image_output].every(v => v == null || v === 0)
+}
+
 export function eventSpend(event: Record<string, unknown>, model: string, at: number, meter: Meter): number | undefined {
   const cost = record(event.cost)
-  if (!meter.models.has(model) || event.accounting_quality !== "complete" || event.price_source !== "custom" ||
-    !cost || cost.currency !== "USD" || !nonnegative(cost.total) || cost.tiered ||
-    [cost.image_input_tokens, cost.image_cache_read_tokens, cost.image_output_tokens].some(n => n != null && n !== 0)) return
+  if (!meter.models.has(model) || !cost || cost.currency !== "USD" || !nonnegative(cost.total) || cost.tiered) return
   const multiplier = cost.multiplier ?? 1
   if (multiplier !== 0 && multiplier !== 1) return
+  if (unmeteredFailure(event, cost)) return 0
+  if (event.accounting_quality !== "complete" || event.price_source !== "custom" ||
+    [cost.image_input_tokens, cost.image_cache_read_tokens, cost.image_output_tokens].some(n => n != null && n !== 0)) return
   let factor = 1
   if (meter.tiers) {
     const tier = (value: unknown) => {

@@ -11,7 +11,3 @@ node_modules/
 .vscode/
 .opencode/
 opencode.json*
-deploy/
-dist/*
-!dist/gui-experimental.cjs
-!dist/server/

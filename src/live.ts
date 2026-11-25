@@ -1,4 +1,4 @@
-import { CpaClient, CpaError } from "./cpa.ts"
+import { CpaError, type CpaClient } from "./cpa.ts"
 import { measure, type MeteredSnapshot } from "./quota.ts"
 import { currentView, type Issue, type LiveSnapshot } from "./view.ts"
 import type { Policy } from "./policy.ts"

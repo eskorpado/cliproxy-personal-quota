@@ -41,7 +41,7 @@ test("Повторное чтение устаревших данных не в�
 })
 
 test("В демо показан отсчёт до известной границы, а не срок годности снимка", () => {
-  const now = new Date("2025-01-01T12:00:00Z")
+  const now = new Date("2026-11-25T12:00:00Z")
   const [codex, kimi, zai] = demoSnapshot("normal", now).pools
   assert.equal(resetTime(codex.windows[0].resetAt, +now)?.relative, "через 2 минуты")
   assert.equal(resetTime(codex.windows[0].resetAt, +now)?.urgent, true)

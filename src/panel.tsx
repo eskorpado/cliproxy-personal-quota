@@ -3,7 +3,7 @@ import { formatTime, scenarios, windowLabel, type Scenario, type Snapshot } from
 import { resetTime, type Issue, type LiveSnapshot } from "./view"
 
 const notices: Record<Issue, string> = {
-  provider: "Проверьте providerID и origin в настройках плагина: они должны соответствовать вашему HTTPS-провайдеру CPA.",
+  provider: "Проверьте ID и HTTPS-адрес провайдера в настройках плагина.",
   key: "У провайдера нет активного API-ключа.",
   unauthorized: "CPA не подтвердил доступ по активному ключу.",
   unreachable: "Не удалось получить данные квот.",
