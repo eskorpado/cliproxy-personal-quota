@@ -6,11 +6,11 @@
 
 Если вы уже пользуетесь CLIProxyAPI в OpenCode Desktop, **отправьте агенту один промпт**:
 
-> Установи и настрой «Мои квоты» для моего подключённого CLIProxyAPI по инструкции https://github.com/eskorpado/cliproxy-personal-quota/blob/v0.1.0/INSTALL.md
+> Установи «Мои квоты» для моего CLIProxyAPI по инструкции https://github.com/eskorpado/cliproxy-personal-quota/blob/main/INSTALL.md
 
 Затем откройте `/quotas` в сессии на встроенном сервере Desktop. Агент возьмёт адрес из существующего подключения; вводить API-ключ, клонировать репозиторий и собирать плагин не нужно. Если подключений несколько и выбор неочевиден, агент спросит только имя провайдера.
 
-**Совместимость:** OpenCode Desktop 2.3.2, HTTPS-провайдер `@opencode/ai/providers/openai-compatible`, CLIProxyAPI с `cpa-key-billing` и каталогом `/.well-known/cpa-quota-policy.json`. Пустая панель при успешном чтении означает, что для ключа нет подходящих квот; администратор может проверить доступ и метки `quota=N` или `quota.<pool-id>=N`.
+**Совместимость:** нужен OpenCode Desktop с поддержкой серверных и GUI-плагинов, RPC и индикаторов над полем ввода (`ComposerPill`). На стороне прокси — HTTPS-провайдер `@opencode/ai/providers/openai-compatible`, `cpa-key-billing` и каталог `/.well-known/cpa-quota-policy.json`. Пустая панель при успешном чтении означает, что для ключа нет подходящих квот; администратор может проверить доступ и метки `quota=N` или `quota.<pool-id>=N`.
 
 ## Как считаются квоты
 
@@ -22,4 +22,4 @@
 
 ## Разработка
 
-Node.js 24 и npm. `npm ci`, затем `npm run check`, `npm test` и `npm run build`. Для разработки GUI есть `npm run watch`. В Git включены готовые точки входа из `dist/`, чтобы установка из тега не запускала сборку на машине пользователя. `npm pack` создаёт архив релиза. См. [лицензию MIT](LICENSE).
+Исходники — в `src/`, тесты — в `test/`, задачи проверки и сборки — в [`package.json`](package.json). Версии инструментов для воспроизводимой сборки зафиксированы в lock-файле; [CI](.github/workflows/ci.yml) сверяет сборку с опубликованным `dist/`. Установка из тега использует готовые файлы. [Лицензия MIT](LICENSE).

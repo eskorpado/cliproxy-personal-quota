@@ -1,6 +1,6 @@
 {
   "name": "cliproxy-personal-quota",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Мои квоты — панель OpenCode Desktop для CLIProxyAPI",
@@ -19,7 +19,7 @@
     "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "dependencies": {
-    "@opencode/plugin": "2.3.2"
+    "@opencode/plugin": "^2.3.2"
   },
   "devDependencies": {
     "solid-js": "^1.9.12",
