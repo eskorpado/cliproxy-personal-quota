@@ -1,0 +1,30 @@
+{
+  "name": "cliproxy-personal-quota",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Мои квоты — панель OpenCode Desktop для CLIProxyAPI",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/eskorpado/cliproxy-personal-quota.git" },
+  "keywords": ["opencode", "opencode-plugin", "cliproxyapi", "quota"],
+  "files": ["dist/gui-experimental.cjs", "dist/server/*.js"],
+  "exports": {
+    ".": "./dist/server/server.js",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
+  },
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "watch": "vite build --watch",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.3.2"
+  },
+  "devDependencies": {
+    "solid-js": "^1.9.12",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.8",
+    "vite-plugin-solid": "^2.11.17"
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "revision": "demo-1",
+  "allocation": { "source": "cpa.profile.identity.label", "tag": "quota", "missing": "hide" },
+  "pools": [
+    {
+      "id": "demo-gpt",
+      "modelFamilyPrefix": "gpt",
+      "title": "Пример: GPT",
+      "account": { "category": "codex", "match": "exactlyOne" },
+      "meter": {
+        "source": "cpa.cost",
+        "unit": "weekly_percentage_points",
+        "models": ["gpt-6.1-sol", "gpt-6.2-sol"],
+        "tierAdjustments": {
+          "requiresBaseCost": true,
+          "tiers": { "standard": 1, "priority": { "gpt-6.2-*": 2, "gpt-6.1-*": 2.5, "gpt-6-*": 2.5 } },
+          "unknown": "incomplete"
+        }
+      },
+      "windows": [
+        { "id": "week", "title": "7 дней", "seconds": 604800, "capacity": 100, "boundary": { "type": "anchored", "anchorUtc": null } }
+      ]
+    },
+    {
+      "id": "demo-kimi",
+      "modelFamilyPrefix": "kimi",
+      "title": "Пример: Kimi",
+      "account": { "category": "kimi-ai", "match": "exactlyOne" },
+      "meter": { "source": "cpa.cost", "unit": "million_weighted_tokens", "models": ["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"] },
+      "windows": [
+        { "id": "short", "title": "5 часов", "seconds": 18000, "capacity": 50, "boundary": { "type": "anchored", "anchorUtc": null } },
+        { "id": "week", "title": "7 дней", "seconds": 604800, "capacity": 500, "boundary": { "type": "anchored", "anchorUtc": null } }
+      ]
+    },
+    {
+      "id": "demo-glm",
+      "modelFamilyPrefix": "glm",
+      "title": "Пример: GLM",
+      "account": { "category": "zai", "match": "exactlyOne" },
+      "meter": {
+        "source": "cpa.cost",
+        "unit": "zai_credits",
+        "models": ["glm-5.3", "glm-5.3-flash", "glm-5.4"],
+        "timeAdjustment": { "timezone": "UTC", "defaultFactor": 0.5, "rules": [{ "weekdays": [1, 2, 3, 4, 5], "from": "06:00", "until": "10:00", "factor": 1 }] }
+      },
+      "windows": [
+        { "id": "short", "title": "5 часов", "seconds": 18000, "capacity": 1000, "boundary": { "type": "rolling" } },
+        { "id": "week", "title": "7 дней", "seconds": 604800, "capacity": 10000, "boundary": { "type": "anchored", "anchorUtc": null } }
+      ]
+    }
+  ]
+}

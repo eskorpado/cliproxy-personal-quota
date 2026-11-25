@@ -1,0 +1,17 @@
+node_modules/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+*.log
+*.tgz
+.npmrc
+.idea/
+.vscode/
+.opencode/
+opencode.json*
+deploy/
+dist/*
+!dist/gui-experimental.cjs
+!dist/server/
