@@ -16,8 +16,9 @@ export function liveQuota(resolveIdentity, cpa, clock = Date.now) {
             if (!policy)
                 return empty(issue ?? "catalog-unreachable");
             // Don't reuse percentages across pricing/cycle policy changes.
-            if (state.policy !== policy)
-                state.previous = undefined;
+            if (state.policy !== policy && state.previous) {
+                state.previous = { view: { pools: [], asOf: null }, fixed: new Map(), knownPools: new Set(), spendCache: state.previous.spendCache };
+            }
             state.policy = policy;
             const next = await measure(cpa.api(state.key, signal), policy, clock(), state.previous);
             signal.throwIfAborted();

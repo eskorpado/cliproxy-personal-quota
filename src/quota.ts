@@ -8,7 +8,7 @@ type Interval = { from: number; to: number; end?: number }
 type Meter = Extract<PoolPolicy["meter"], { source: "cpa.cost" }>
 type Account = { index: string; category: string; active: boolean }
 type Previous = { share: number; index: string; window: QuotaWindow; end: number; asOf: number }
-type MeteredSnapshot = { view: LiveSnapshot; fixed: Map<string, Previous>; knownPools: Set<string> }
+type MeteredSnapshot = { view: LiveSnapshot; fixed: Map<string, Previous>; knownPools: Set<string>; spendCache: Map<string, CachedSpend> }
 export type { MeteredSnapshot }
 
 function invalid(): never { throw new CpaError(0) }
@@ -104,29 +104,43 @@ export function eventSpend(event: Record<string, unknown>, model: string, at: nu
 
 const PAGE_SIZE = 250
 const PAGES_IN_FLIGHT = 4
-type SpendEstimate = { used: number | null; skipped: number }
+const SPEND_CACHE_TTL = 30 * MINUTE
+type Slice = Interval & { totals: Totals; used: number; skipped: number; verifiedAt: number }
+type CachedSpend = { index: string; pricing: string; end?: number; slices: Slice[] }
 
-async function spend(api: CpaApi, index: string, interval: Interval, meter: Meter): Promise<SpendEstimate | "coverage" | undefined> {
-  // At the exact cycle boundary [from, to) is empty; CPA needs a nonempty range.
-  if (interval.from === interval.to) return { used: 0, skipped: 0 }
-  const range = { from: new Date(interval.from).toISOString(), to: new Date(interval.to).toISOString() }
-  const query = { ...range, auth_index: index }
-  const expected = await usage(api, query)
-  // The default assumes seven days of history. Operators can declare a shorter
-  // retention or an explicit guarantee for longer windows in their catalog.
-  const coverage = meter.coverage
-  if ((coverage?.from !== undefined && interval.from < coverage.from) ||
-    interval.from < interval.to - (coverage?.retentionDays ?? 7) * DAY) return "coverage"
-  if (!expected.size) return { used: 0, skipped: 0 }
+function rangeQuery({ from, to }: Interval) {
+  return { from: new Date(from).toISOString(), to: new Date(to).toISOString() }
+}
+
+function addTotals(target: Totals, source: Totals) {
+  for (const [model, row] of source) merge(target, model, row.requests, row.cost)
+}
+
+const dayStart = (at: number) => Math.floor(at / DAY) * DAY
+
+function appendSlice(slices: Slice[], slice: Slice) {
+  const last = slices.at(-1)
+  if (last?.to !== slice.from || dayStart(last.from) !== dayStart(slice.from)) {
+    slices.push(slice)
+    return
+  }
+  const totals = new Map(last.totals)
+  addTotals(totals, slice.totals)
+  slices[slices.length - 1] = { from: last.from, to: slice.to, totals, used: last.used + slice.used,
+    skipped: last.skipped + slice.skipped, verifiedAt: Math.min(last.verifiedAt, slice.verifiedAt) }
+}
+
+async function readSlices(api: CpaApi, index: string, interval: Interval, meter: Meter, expected: Totals, ids: Set<string>, now: number) {
+  if (!expected.size) return []
   const expectedCount = [...expected.values()].reduce((n, row) => n + row.requests, 0)
   if (!requestCount(expectedCount)) return
 
+  const range = rangeQuery(interval), query = { ...range, auth_index: index }
   const head = data(await api("/events", { ...range, limit: "1" }))
   const snapshot = head.snapshot_id
   const options = record(head.filter_options)?.credential_options
   if (typeof snapshot !== "string" || !/^\d{1,19}$/.test(snapshot) || !Array.isArray(options) || options.length > 64) return
-  const ids = new Set<string>(), matched: Totals = new Map(), credentials = new Set<string>()
-  let total = 0, skipped = 0
+  const initialCount = ids.size, matched: Totals = new Map(), credentials = new Set<string>(), days = new Map<number, Slice>()
   for (const raw of options) {
     const option = record(raw), token = option?.value
     if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token) || credentials.has(token)) return
@@ -141,7 +155,7 @@ async function spend(api: CpaApi, index: string, interval: Interval, meter: Mete
     }
     const count = [...intersection.values()].reduce((n, row) => n + row.requests, 0)
     if (!count) continue
-    if (count !== option?.count || count > expectedCount - ids.size) return
+    if (count !== option?.count || count > expectedCount - (ids.size - initialCount)) return
     const seen: Totals = new Map()
     // All pages use the same snapshot. Bound concurrent reads instead of
     // rejecting an entire window because its journal has many events.
@@ -161,17 +175,77 @@ async function spend(api: CpaApi, index: string, interval: Interval, meter: Mete
           if (!(at >= interval.from && at < interval.to) || typeof model !== "string" || !cost || !nonnegative(cost.total)) return
           // Even events without comparable prices must reconcile against the account.
           merge(seen, model, 1, cost.total)
+          const day = dayStart(at)
+          let slice = days.get(day)
+          if (!slice) {
+            slice = { from: Math.max(day, interval.from), to: Math.min(day + DAY, interval.to), totals: new Map(), used: 0, skipped: 0, verifiedAt: now }
+            days.set(day, slice)
+          }
+          merge(slice.totals, model, 1, cost.total)
           const adjusted = eventSpend(event, model, at, meter)
-          if (adjusted === undefined) skipped++
-          else total += adjusted
+          if (adjusted === undefined) slice.skipped++
+          else slice.used += adjusted
         }
       }
     }
     if (!equal(intersection, seen)) return
-    for (const [model, row] of seen) merge(matched, model, row.requests, row.cost)
+    addTotals(matched, seen)
   }
-  if (!equal(expected, matched) || !Number.isFinite(total)) return
-  return { used: skipped === ids.size ? null : total, skipped }
+  if (!equal(expected, matched)) return
+  return [...days.values()].sort((a, b) => a.from - b.from)
+}
+
+async function spend(api: CpaApi, index: string, interval: Interval, meter: Meter, previous?: CachedSpend) {
+  const pricing = JSON.stringify([[...meter.models].sort(), meter.tiers, meter.time])
+  const cache: CachedSpend = { index, pricing, end: interval.end, slices: [] }
+  // At the exact cycle boundary [from, to) is empty; CPA needs a nonempty range.
+  if (interval.from === interval.to) return { used: 0, skipped: 0, cache }
+  const expected = await usage(api, { ...rangeQuery(interval), auth_index: index })
+  // The default assumes seven days of history. Operators can declare a shorter
+  // retention or an explicit guarantee for longer windows in their catalog.
+  const coverage = meter.coverage
+  if ((coverage?.from !== undefined && interval.from < coverage.from) ||
+    interval.from < interval.to - (coverage?.retentionDays ?? 7) * DAY) return "coverage" as const
+  if (!expected.size) return { used: 0, skipped: 0, cache }
+
+  const ranges: { interval: Interval; cached?: Slice }[] = []
+  let from = interval.from
+  if (previous?.index === index && previous.pricing === pricing && previous.end === interval.end) {
+    for (const slice of previous.slices) {
+      // CPA's aggregates cannot detect every correction to event metadata.
+      if (slice.from < from || slice.to > interval.to || interval.to - slice.verifiedAt >= SPEND_CACHE_TTL) continue
+      if (slice.from > from) ranges.push({ interval: { from, to: slice.from } })
+      ranges.push({ interval: slice, cached: slice })
+      from = slice.to
+    }
+  }
+  if (from < interval.to) ranges.push({ interval: { from, to: interval.to } })
+
+  // Recheck even closed days: a request can finish late and be logged at its start time.
+  const totals: Totals = new Map(), ids = new Set<string>()
+  for (let start = 0; start < ranges.length; start += PAGES_IN_FLIGHT) {
+    const batch = ranges.slice(start, start + PAGES_IN_FLIGHT)
+    const checks = ranges.length === 1 ? [expected] : await Promise.all(batch.map(({ interval }) =>
+      usage(api, { ...rangeQuery(interval), auth_index: index })))
+    for (const [i, { interval: range, cached }] of batch.entries()) {
+      const current = checks[i]
+      addTotals(totals, current)
+      const slices = cached && equal(cached.totals, current) ? [cached] : await readSlices(api, index, range, meter, current, ids, interval.to)
+      if (!slices) return
+      for (const slice of slices) appendSlice(cache.slices, slice)
+    }
+  }
+  if (!equal(expected, totals)) return
+  const reconciled: Totals = new Map()
+  let used = 0, skipped = 0
+  for (const slice of cache.slices) {
+    addTotals(reconciled, slice.totals)
+    used += slice.used
+    skipped += slice.skipped
+  }
+  const count = [...expected.values()].reduce((sum, row) => sum + row.requests, 0)
+  if (!equal(expected, reconciled) || !Number.isFinite(used) || !requestCount(count)) return
+  return { used: skipped === count ? null : used, skipped, cache }
 }
 
 function staleWindow(previous: Previous | undefined, index: string, share: number, now: number, end?: number) {
@@ -189,8 +263,8 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
     const share = allocation(label ?? "", pool.id)
     return share ? [{ pool, share }] : []
   })
-  const fixed = new Map<string, Previous>(), pools: LiveSnapshot["pools"] = [], knownPools = new Set<string>()
-  if (!assigned.length) return { view: { pools, asOf: now }, fixed, knownPools }
+  const fixed = new Map<string, Previous>(), pools: LiveSnapshot["pools"] = [], knownPools = new Set<string>(), spendCache = new Map<string, CachedSpend>()
+  if (!assigned.length) return { view: { pools, asOf: now }, fixed, knownPools, spendCache }
   // A failed inventory must not be treated as successful account removal. Profile must
   // have been rechecked first, so do not reuse numbers after a share change.
   let accounts: Account[]
@@ -207,7 +281,7 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
       })
       pools.push({ modelFamilyPrefix: pool.modelFamilyPrefix, windows })
     }
-    return { view: { pools, asOf: previous?.view.asOf ?? null, issue: "unreachable" }, fixed, knownPools }
+    return { view: { pools, asOf: previous?.view.asOf ?? null, issue: "unreachable" }, fixed, knownPools, spendCache }
   }
 
   for (const { pool, share } of assigned) {
@@ -237,13 +311,14 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
         continue
       }
       try {
-        const estimate = await spend(api, account.index, interval, pool.meter)
+        const estimate = await spend(api, account.index, interval, pool.meter, previous?.spendCache.get(key))
         if (estimate === undefined || estimate === "coverage") {
           windows.push(withReset(unavailable(w, estimate === "coverage" ? "Не подтверждено, что журнал CPA покрывает всё окно." :
             "Не удалось сверить журнал начислений с данными аккаунта.", "partial")))
           continue
         }
-        const { used, skipped } = estimate
+        const { used, skipped, cache } = estimate
+        spendCache.set(key, cache)
         const skippedNote = `Не учтено запросов: ${skipped}.`
         if (used === null) {
           windows.push(withReset(unavailable(w, `${skippedNote} Нет подтверждённых начислений.`, "partial")))
@@ -265,9 +340,15 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
         windows.push(fallback("Не удалось прочитать расход в CPA.", interval.end))
       }
     }
-    if (revoked) { for (const w of pool.windows) fixed.delete(`${pool.id}/${w.id}`); continue }
+    if (revoked) {
+      for (const w of pool.windows) {
+        fixed.delete(`${pool.id}/${w.id}`)
+        spendCache.delete(`${pool.id}/${w.id}`)
+      }
+      continue
+    }
     knownPools.add(pool.id)
     pools.push({ modelFamilyPrefix: pool.modelFamilyPrefix, windows })
   }
-  return { view: { pools, asOf: now }, fixed, knownPools }
+  return { view: { pools, asOf: now }, fixed, knownPools, spendCache }
 }

@@ -45,7 +45,7 @@ function codexPolicy(coverage?: { fromUtc?: string; retentionDays?: number }) {
 function stub() {
   let now = at, label = "test user quota=20", expectedKey = fixtureKey, files = [account]
   let usageCode = 200, profileCode = 200, inventoryCode = 200, catalogCode = 200
-  let rows = [{ model, requests: 1, cost_usd: 3 }], entries: EventFixture[] = [baseEvent], credentialCount = 1
+  let events: EventFixture[] = [baseEvent], journal: EventFixture[] | undefined, credentialCount: number | undefined
   let catalogue: unknown = codexPolicy()
   const reset = at + hour
   const calls: { path: string; query: URLSearchParams; etag: string | null }[] = []
@@ -62,24 +62,38 @@ function stub() {
     }
     assert.equal(headers.get("authorization"), `Bearer ${expectedKey}`)
     assert.equal(url.searchParams.has("key"), false)
+    const from = Date.parse(url.searchParams.get("from") ?? ""), to = Date.parse(url.searchParams.get("to") ?? "")
+    const inRange = events.filter(event => {
+      const timestamp = Date.parse(String(event.at))
+      return from <= timestamp && timestamp < to
+    })
     switch (path) {
       case "/profile": return Response.json({ tracked: true, identity: { label, preview: "private" } }, { status: profileCode })
       case "/auth-files": return Response.json({ files }, { status: inventoryCode })
-      case "/usage/models":
+      case "/usage/models": {
         assert.equal(url.searchParams.get("auth_index"), account.auth_index)
         const length = 168 * hour
-        assert.equal(url.searchParams.get("from"), new Date(reset + Math.floor((now - reset) / length) * length).toISOString())
-        assert.equal(url.searchParams.get("to"), new Date(now).toISOString())
+        assert.ok(from >= reset + Math.floor((now - reset) / length) * length && from < to && to <= now)
         if (url.searchParams.get("value") === unrelated) return Response.json({ code: "expired_filter" }, { status: 400 })
-        return Response.json({ models: rows }, { status: usageCode })
+        const totals = new Map<string, { model: string; requests: number; cost_usd: number }>()
+        for (const event of inRange) {
+          const model = event.billing_model
+          const row = totals.get(model) ?? { model, requests: 0, cost_usd: 0 }
+          row.requests++
+          row.cost_usd += event.cost.total
+          totals.set(model, row)
+        }
+        return Response.json({ models: [...totals.values()] }, { status: usageCode })
+      }
       case "/events":
         if (url.searchParams.has("credential")) {
           assert.equal(url.searchParams.get("credential"), token)
           assert.equal(url.searchParams.get("snapshot_id"), "81")
           const offset = Number(url.searchParams.get("offset")), size = Number(url.searchParams.get("limit"))
+          const entries = journal ?? inRange
           return Response.json({ snapshot_id: "81", total: entries.length, entries: entries.slice(offset, offset + size) })
         }
-        return Response.json({ snapshot_id: "81", filter_options: { credential_options: [{ value: unrelated, count: 3 }, { value: token, count: credentialCount }] } })
+        return Response.json({ snapshot_id: "81", filter_options: { credential_options: [{ value: unrelated, count: 3 }, { value: token, count: credentialCount ?? inRange.length }] } })
       default: throw new Error(`Unexpected test route ${path}`)
     }
   }
@@ -94,20 +108,9 @@ function stub() {
     catalog: (v: unknown, code = 200) => { catalogue = v; catalogCode = code },
     identity: (v: Identity) => { identity = v; if ("key" in v) expectedKey = v.key },
     count: (n: number) => { credentialCount = n },
-    journal: (v: EventFixture[]) => { entries = v },
-    events: (v: EventFixture[]) => {
-      entries = v; credentialCount = v.length
-      const totals = new Map<string, typeof rows[number]>()
-      for (const event of v) {
-        const model = event.billing_model
-        const row = totals.get(model) ?? { model, requests: 0, cost_usd: 0 }
-        row.requests++
-        row.cost_usd += event.cost.total
-        totals.set(model, row)
-      }
-      rows = [...totals.values()]
-    },
-    empty: () => { rows = []; entries = []; credentialCount = 0 },
+    journal: (v: EventFixture[]) => { journal = v },
+    events: (v: EventFixture[]) => { events = v; journal = undefined; credentialCount = undefined },
+    empty: () => { events = []; journal = undefined; credentialCount = undefined },
   }
 }
 
@@ -319,11 +322,50 @@ test("a weekly journal above 10,000 events is fully reconciled across page batch
   assert.equal((await window()).pct, 70)
   assert.equal(s.calls.filter(c => c.query.has("credential")).length, 43)
 
-  // Matching counts and costs are insufficient if an ID repeats in a later batch.
+  // After the cache expires, matching totals cannot hide an ID repeated in a later batch.
   s.journal([...events.slice(0, -1), { ...events.at(-1)!, id: events[0].id }])
+  s.now(at + 30 * 60_000)
   const duplicate = await window()
   assert.equal(duplicate.pct, null)
   assert.match(duplicate.detail!, /Не удалось сверить журнал/)
+})
+
+test("warm estimates only read new or changed event ranges, including late arrivals", async () => {
+  const s = stub(), iso = (time: number) => new Date(time).toISOString()
+  const older = { ...baseEvent, id: "74", at: "2026-11-24T09:00:00Z", cost: { ...baseEvent.cost, total: 1 } }
+  const late = { ...failedEvent, id: "75", at: "2026-11-24T10:00:00Z" }
+  const fresh = { ...baseEvent, id: "79", at: iso(at), cost: { ...baseEvent.cost, total: 1 } }
+  const pages = () => s.calls.splice(0).filter(call => call.query.has("credential")).map(call => [call.query.get("from"), call.query.get("to")])
+  const window = async (revalidate = false) => (await s.snapshot(revalidate)).pools[0].windows[0]
+  s.events([older, baseEvent])
+  assert.equal((await window()).pct, 60)
+  assert.equal(pages().length, 1)
+
+  // Unchanged pricing under a newly published catalog must not invalidate verified spend.
+  s.catalog({ ...codexPolicy(), revision: "next" })
+  s.now(at + 60_000)
+  assert.equal((await window(true)).pct, 60)
+  assert.deepEqual(pages(), [])
+
+  s.events([older, baseEvent, fresh])
+  assert.equal((await window()).pct, 50)
+  assert.deepEqual(pages(), [[iso(at), iso(at + 60_000)]])
+
+  s.events([older, late, baseEvent, fresh])
+  const partial = await window()
+  assert.equal(partial.pct, 50)
+  assert.equal(partial.detail, "Не учтено запросов: 1.")
+  assert.deepEqual(pages(), [["2026-11-24T00:00:00.000Z", "2026-11-25T00:00:00.000Z"]])
+
+  s.identity({ key: "other-synthetic-key" })
+  assert.equal((await window()).pct, 50)
+  assert.equal(pages().length, 1)
+
+  const changed = structuredClone(codexPolicy())
+  changed.pools[0].meter.tierAdjustments!.tiers.priority["gpt-6.2-*"] = 1
+  s.catalog(changed)
+  assert.equal((await window(true)).pct, 75)
+  assert.equal(pages().length, 1)
 })
 
 test("snapshots apply allocation changes without resetting spend and disclose only display fields", async () => {
@@ -345,14 +387,14 @@ test("event pages are pinned; account collisions and coverage gaps don't invent 
   assert.equal(paged.detail, "Не учтено запросов: 2.")
   assert.deepEqual(s.calls.filter(c => c.query.has("credential")).map(c => c.query.get("offset")), ["0", "250"])
   s.count(256)
+  s.now(at + 30 * 60_000)
   const mismatch = (await s.snapshot()).pools[0].windows[0]
   assert.equal(mismatch.status, "partial")
   assert.equal(mismatch.pct, null)
   s.empty()
   assert.equal((await s.snapshot()).pools[0].windows[0].pct, 100)
   s.catalog(codexPolicy({ fromUtc: "2026-11-25T00:00:00Z" }))
-  s.now(at + 301_000)
-  const window = (await s.snapshot()).pools[0].windows[0]
+  const window = (await s.snapshot(true)).pools[0].windows[0]
   assert.equal(window.status, "partial")
   assert.equal(window.resetAt, at + hour)
   assert.match(window.detail!, /журнал CPA покрывает всё окно/)
