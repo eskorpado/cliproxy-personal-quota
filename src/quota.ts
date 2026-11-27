@@ -103,7 +103,7 @@ export function eventSpend(event: Record<string, unknown>, model: string, at: nu
 }
 
 const PAGE_SIZE = 250
-const MAX_EVENTS = 10_000
+const PAGES_IN_FLIGHT = 4
 type SpendEstimate = { used: number | null; skipped: number }
 
 async function spend(api: CpaApi, index: string, interval: Interval, meter: Meter): Promise<SpendEstimate | "coverage" | undefined> {
@@ -118,7 +118,8 @@ async function spend(api: CpaApi, index: string, interval: Interval, meter: Mete
   if ((coverage?.from !== undefined && interval.from < coverage.from) ||
     interval.from < interval.to - (coverage?.retentionDays ?? 7) * DAY) return "coverage"
   if (!expected.size) return { used: 0, skipped: 0 }
-  if ([...expected.values()].reduce((n, row) => n + row.requests, 0) > MAX_EVENTS) return
+  const expectedCount = [...expected.values()].reduce((n, row) => n + row.requests, 0)
+  if (!requestCount(expectedCount)) return
 
   const head = data(await api("/events", { ...range, limit: "1" }))
   const snapshot = head.snapshot_id
@@ -140,23 +141,30 @@ async function spend(api: CpaApi, index: string, interval: Interval, meter: Mete
     }
     const count = [...intersection.values()].reduce((n, row) => n + row.requests, 0)
     if (!count) continue
-    if (count !== option?.count || ids.size + count > MAX_EVENTS) return
+    if (count !== option?.count || count > expectedCount - ids.size) return
     const seen: Totals = new Map()
-    for (let offset = 0; offset < count; offset += PAGE_SIZE) {
-      const page = data(await api("/events", { ...range, credential: token, snapshot_id: snapshot, limit: String(PAGE_SIZE), offset: String(offset) }))
-      if (page.snapshot_id !== snapshot || page.total !== count || !Array.isArray(page.entries) || page.entries.length !== Math.min(PAGE_SIZE, count - offset)) return
-      for (const raw of page.entries) {
-        const event = record(raw), id = event?.id
-        if (!event || typeof id !== "string" || !/^\d{1,19}$/.test(id) || ids.has(id)) return
-        ids.add(id)
-        const at = utc(event.at), model = event.billing_model || event.upstream_model, cost = record(event.cost)
-        if (!(at >= interval.from && at < interval.to) || typeof model !== "string" || !cost || !nonnegative(cost.total)) return
-        // Reconcile every event against the account, even if its cost cannot
-        // be used in the estimate. No result is published until both checks pass.
-        merge(seen, model, 1, cost.total)
-        const adjusted = eventSpend(event, model, at, meter)
-        if (adjusted === undefined) skipped++
-        else total += adjusted
+    // All pages use the same snapshot. Bound concurrent reads instead of
+    // rejecting an entire window because its journal has many events.
+    for (let start = 0; start < count; start += PAGE_SIZE * PAGES_IN_FLIGHT) {
+      const offsets = Array.from({ length: Math.min(PAGES_IN_FLIGHT, Math.ceil((count - start) / PAGE_SIZE)) },
+        (_, i) => start + i * PAGE_SIZE)
+      const pages: ReturnType<typeof data>[] = await Promise.all(offsets.map(async offset => data(await api("/events", {
+        ...range, credential: token, snapshot_id: snapshot, limit: String(PAGE_SIZE), offset: String(offset),
+      }))))
+      for (const [i, page] of pages.entries()) {
+        if (page.snapshot_id !== snapshot || page.total !== count || !Array.isArray(page.entries) || page.entries.length !== Math.min(PAGE_SIZE, count - offsets[i])) return
+        for (const raw of page.entries) {
+          const event = record(raw), id = event?.id
+          if (!event || typeof id !== "string" || !/^\d{1,19}$/.test(id) || ids.has(id)) return
+          ids.add(id)
+          const at = utc(event.at), model = event.billing_model || event.upstream_model, cost = record(event.cost)
+          if (!(at >= interval.from && at < interval.to) || typeof model !== "string" || !cost || !nonnegative(cost.total)) return
+          // Even events without comparable prices must reconcile against the account.
+          merge(seen, model, 1, cost.total)
+          const adjusted = eventSpend(event, model, at, meter)
+          if (adjusted === undefined) skipped++
+          else total += adjusted
+        }
       }
     }
     if (!equal(intersection, seen)) return

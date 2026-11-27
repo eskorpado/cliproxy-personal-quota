@@ -309,6 +309,23 @@ test("even skipped events must reconcile by count, cost, identity and window", a
   }
 })
 
+test("a weekly journal above 10,000 events is fully reconciled across page batches", async () => {
+  const s = stub()
+  const events = Array.from({ length: 10_708 }, (_, i) => ({
+    ...baseEvent, id: String(i + 1), cost: { ...baseEvent.cost, total: i === 10_707 ? 3 : 0 },
+  }))
+  s.events(events)
+  const window = async () => (await s.snapshot()).pools[0].windows[0]
+  assert.equal((await window()).pct, 70)
+  assert.equal(s.calls.filter(c => c.query.has("credential")).length, 43)
+
+  // Matching counts and costs are insufficient if an ID repeats in a later batch.
+  s.journal([...events.slice(0, -1), { ...events.at(-1)!, id: events[0].id }])
+  const duplicate = await window()
+  assert.equal(duplicate.pct, null)
+  assert.match(duplicate.detail!, /Не удалось сверить журнал/)
+})
+
 test("snapshots apply allocation changes without resetting spend and disclose only display fields", async () => {
   const s = stub()
   const first = await s.snapshot()
