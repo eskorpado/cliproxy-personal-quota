@@ -19,7 +19,7 @@ export const QuotaRpc = Rpc.define({
                                         properties: {
                                             title: { type: "string" }, status: { enum: ["ok", "over", "partial", "missing"] },
                                             pct: { type: ["number", "null"], minimum: 0, maximum: 100 }, detail: { type: "string" },
-                                            resetAt: { type: "number" }, validUntil: { type: "number" }, staleAsOf: { type: "number" },
+                                            resetAt: { type: "number" }, validUntil: { type: "number" },
                                         },
                                     } },
                             },

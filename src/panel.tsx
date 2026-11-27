@@ -16,7 +16,6 @@ export function QuotaPanel(props: {
   change(value: Scenario): void; refresh(): void
 }) {
   const issue = () => "issue" in props.data ? props.data.issue : undefined
-  const staleDemo = () => "stale" in props.data && props.data.stale
   const asOf = () => props.data.asOf === null ? null : formatTime(new Date(props.data.asOf))
   return <section class="cpq-panel" aria-label="Мои квоты">
     <header>
@@ -25,15 +24,12 @@ export function QuotaPanel(props: {
     <Show when={props.supported && issue()}>{value =>
       <p class="cpq-notice" role="status">{notices[value()]}{value().startsWith("catalog-") && props.data.asOf !== null ? " Используется последняя валидная редакция." : ""}</p>
     }</Show>
-    <Show when={staleDemo()}>
-      <p class="cpq-notice" role="status">Устарело · {asOf()}. Показан последний доступный снимок.</p>
-    </Show>
     <div class="cpq-cards">
       <For each={props.data.pools} fallback={<p class="cpq-empty">{!props.supported ? "Квоты доступны только во встроенном сервере OpenCode." : props.pending ? "Читаем квоты…" : "Нет доступных квот."}</p>}>
         {pool => <section class="cpq-card" aria-label={pool.modelFamilyPrefix.toUpperCase()}>
           <h3>{pool.modelFamilyPrefix.toUpperCase()}</h3>
           <For each={pool.windows}>{w =>
-            <div class="cpq-window" data-tone={staleDemo() || w.staleAsOf !== undefined || w.status === "missing" ? "muted" : w.status === "over" ? "danger" : w.status === "partial" || (w.pct ?? 100) <= 25 ? "warn" : "good"}>
+            <div class="cpq-window" data-tone={w.status === "missing" ? "muted" : w.status === "over" ? "danger" : w.status === "partial" || (w.pct ?? 100) <= 25 ? "warn" : "good"}>
               <div class="cpq-line"><span>{w.title}</span><strong>{windowLabel(w)}</strong></div>
               <Show when={w.pct !== null}>
                 <div class="cpq-track" aria-hidden="true"><i style={{ width: `${w.pct}%` }} /></div>
@@ -43,7 +39,6 @@ export function QuotaPanel(props: {
                   <span data-urgent={reset().urgent}> · {reset().relative}</span></p>
               }</Show>
               <Show when={w.detail}><p class="cpq-detail">{w.detail}</p></Show>
-              <Show when={w.staleAsOf}>{at => <p class="cpq-detail">Устарело · {formatTime(new Date(at()))}</p>}</Show>
             </div>
           }</For>
         </section>}

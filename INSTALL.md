@@ -18,7 +18,7 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [{
-    "package": "github:eskorpado/cliproxy-personal-quota#v0.1.6",
+    "package": "github:eskorpado/cliproxy-personal-quota#v0.1.7",
     "options": { "providerID": "my-cpa", "origin": "https://cpa.example.org" }
   }]
 }

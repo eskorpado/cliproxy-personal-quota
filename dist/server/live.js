@@ -2,7 +2,7 @@ import { CpaError } from "./cpa.js";
 import { measure } from "./quota.js";
 import { currentView } from "./view.js";
 const empty = (issue) => ({ pools: [], asOf: null, issue });
-export function liveQuota(resolveIdentity, cpa, clock = Date.now) {
+export function liveQuota(resolveIdentity, cpa, clock = Date.now, log) {
     let active;
     let disposed = false;
     function clear() {
@@ -15,13 +15,8 @@ export function liveQuota(resolveIdentity, cpa, clock = Date.now) {
             const { value: policy, issue } = await cpa.policy(signal, revalidate);
             if (!policy)
                 return empty(issue ?? "catalog-unreachable");
-            // Don't reuse percentages across pricing/cycle policy changes.
-            if (state.policy !== policy && state.previous) {
-                state.previous = { view: { pools: [], asOf: null }, fixed: new Map(), knownPools: new Set(), spendCache: state.previous.spendCache };
-            }
-            state.policy = policy;
-            const next = await measure(cpa.api(state.key, signal), policy, clock(), state.previous);
-            signal.throwIfAborted();
+            const next = await measure(cpa.api(state.key, signal), policy, clock(), state.previous, log);
+            state.controller.signal.throwIfAborted();
             state.previous = next;
             return { ...next.view, ...(issue ? { issue } : {}) };
         }

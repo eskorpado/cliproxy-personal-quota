@@ -6,7 +6,6 @@ export type QuotaWindow = {
   detail?: string
   resetAt?: number
   validUntil?: number
-  staleAsOf?: number
 }
 
 export type PoolView = { modelFamilyPrefix: string; windows: QuotaWindow[] }

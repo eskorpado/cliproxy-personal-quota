@@ -7,9 +7,10 @@ const DAY = 86_400_000
 type Interval = { from: number; to: number; end?: number }
 type Meter = Extract<PoolPolicy["meter"], { source: "cpa.cost" }>
 type Account = { index: string; category: string; active: boolean }
-type Previous = { share: number; index: string; window: QuotaWindow; end: number; asOf: number }
+type Previous = { share: number; index: string; rules: string; window: QuotaWindow; end: number; asOf: number }
 type MeteredSnapshot = { view: LiveSnapshot; fixed: Map<string, Previous>; knownPools: Set<string>; spendCache: Map<string, CachedSpend> }
 export type { MeteredSnapshot }
+export type ReconciliationLog = (event: { check: string; action: "retry" | "keep-last" | "unavailable"; windowSeconds: number }) => void
 
 function invalid(): never { throw new CpaError(0) }
 function data(value: unknown) { return record(value) ?? invalid() }
@@ -133,17 +134,17 @@ function appendSlice(slices: Slice[], slice: Slice) {
 async function readSlices(api: CpaApi, index: string, interval: Interval, meter: Meter, expected: Totals, ids: Set<string>, now: number) {
   if (!expected.size) return []
   const expectedCount = [...expected.values()].reduce((n, row) => n + row.requests, 0)
-  if (!requestCount(expectedCount)) return
+  if (!requestCount(expectedCount)) return "invalid-request-count" as const
 
   const range = rangeQuery(interval), query = { ...range, auth_index: index }
   const head = data(await api("/events", { ...range, limit: "1" }))
   const snapshot = head.snapshot_id
   const options = record(head.filter_options)?.credential_options
-  if (typeof snapshot !== "string" || !/^\d{1,19}$/.test(snapshot) || !Array.isArray(options) || options.length > 64) return
+  if (typeof snapshot !== "string" || !/^\d{1,19}$/.test(snapshot) || !Array.isArray(options) || options.length > 64) return "invalid-journal-snapshot" as const
   const initialCount = ids.size, matched: Totals = new Map(), credentials = new Set<string>(), days = new Map<number, Slice>()
   for (const raw of options) {
     const option = record(raw), token = option?.value
-    if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token) || credentials.has(token)) return
+    if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token) || credentials.has(token)) return "invalid-credential-filter" as const
     credentials.add(token)
     // Tokens represent credential names, not auth indices. Use the intersection with
     // this account, and reject a name collision instead of merging histories.
@@ -155,7 +156,7 @@ async function readSlices(api: CpaApi, index: string, interval: Interval, meter:
     }
     const count = [...intersection.values()].reduce((n, row) => n + row.requests, 0)
     if (!count) continue
-    if (count !== option?.count || count > expectedCount - (ids.size - initialCount)) return
+    if (count !== option?.count || count > expectedCount - (ids.size - initialCount)) return "credential-count-mismatch" as const
     const seen: Totals = new Map()
     // All pages use the same snapshot. Bound concurrent reads instead of
     // rejecting an entire window because its journal has many events.
@@ -166,13 +167,13 @@ async function readSlices(api: CpaApi, index: string, interval: Interval, meter:
         ...range, credential: token, snapshot_id: snapshot, limit: String(PAGE_SIZE), offset: String(offset),
       }))))
       for (const [i, page] of pages.entries()) {
-        if (page.snapshot_id !== snapshot || page.total !== count || !Array.isArray(page.entries) || page.entries.length !== Math.min(PAGE_SIZE, count - offsets[i])) return
+        if (page.snapshot_id !== snapshot || page.total !== count || !Array.isArray(page.entries) || page.entries.length !== Math.min(PAGE_SIZE, count - offsets[i])) return "journal-page-mismatch" as const
         for (const raw of page.entries) {
           const event = record(raw), id = event?.id
-          if (!event || typeof id !== "string" || !/^\d{1,19}$/.test(id) || ids.has(id)) return
+          if (!event || typeof id !== "string" || !/^\d{1,19}$/.test(id) || ids.has(id)) return "invalid-or-duplicate-event-id" as const
           ids.add(id)
           const at = utc(event.at), model = event.billing_model || event.upstream_model, cost = record(event.cost)
-          if (!(at >= interval.from && at < interval.to) || typeof model !== "string" || !cost || !nonnegative(cost.total)) return
+          if (!(at >= interval.from && at < interval.to) || typeof model !== "string" || !cost || !nonnegative(cost.total)) return "invalid-journal-event" as const
           // Even events without comparable prices must reconcile against the account.
           merge(seen, model, 1, cost.total)
           const day = dayStart(at)
@@ -188,10 +189,10 @@ async function readSlices(api: CpaApi, index: string, interval: Interval, meter:
         }
       }
     }
-    if (!equal(intersection, seen)) return
+    if (!equal(intersection, seen)) return "credential-totals-mismatch" as const
     addTotals(matched, seen)
   }
-  if (!equal(expected, matched)) return
+  if (!equal(expected, matched)) return "journal-totals-mismatch" as const
   return [...days.values()].sort((a, b) => a.from - b.from)
 }
 
@@ -231,11 +232,11 @@ async function spend(api: CpaApi, index: string, interval: Interval, meter: Mete
       const current = checks[i]
       addTotals(totals, current)
       const slices = cached && equal(cached.totals, current) ? [cached] : await readSlices(api, index, range, meter, current, ids, interval.to)
-      if (!slices) return
+      if (typeof slices === "string") return slices
       for (const slice of slices) appendSlice(cache.slices, slice)
     }
   }
-  if (!equal(expected, totals)) return
+  if (!equal(expected, totals)) return "interval-totals-mismatch" as const
   const reconciled: Totals = new Map()
   let used = 0, skipped = 0
   for (const slice of cache.slices) {
@@ -244,16 +245,21 @@ async function spend(api: CpaApi, index: string, interval: Interval, meter: Mete
     skipped += slice.skipped
   }
   const count = [...expected.values()].reduce((sum, row) => sum + row.requests, 0)
-  if (!equal(expected, reconciled) || !Number.isFinite(used) || !requestCount(count)) return
+  if (!equal(expected, reconciled) || !Number.isFinite(used) || !requestCount(count)) return "reconciled-totals-mismatch" as const
   return { used: skipped === count ? null : used, skipped, cache }
 }
 
-function staleWindow(previous: Previous | undefined, index: string, share: number, now: number, end?: number) {
-  if (previous && previous.index === index && previous.share === share && previous.end > now && (end === undefined || end === previous.end))
-    return { ...previous.window, staleAsOf: previous.asOf }
+function windowRules(pool: PoolPolicy, window: WindowPolicy) {
+  const { meter } = pool
+  return JSON.stringify([pool.modelFamilyPrefix, pool.category, pool.authIndex, window, meter,
+    meter.source === "cpa.cost" && [...meter.models].sort()])
 }
 
-export async function measure(api: CpaApi, policy: Policy, now: number, previous?: MeteredSnapshot): Promise<MeteredSnapshot> {
+function reusable(previous: Previous | undefined, index: string, share: number, rules: string, now: number, end?: number): previous is Previous {
+  return !!previous && previous.index === index && previous.share === share && previous.rules === rules && previous.end > now && end === previous.end
+}
+
+export async function measure(api: CpaApi, policy: Policy, now: number, previous?: MeteredSnapshot, log?: ReconciliationLog): Promise<MeteredSnapshot> {
   const profile = data(await api("/profile"))
   if (profile.tracked === false) throw new CpaError(401)
   if (profile.tracked !== true) invalid()
@@ -275,15 +281,18 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
       knownPools.add(pool.id)
       const windows = pool.windows.map(w => {
         const key = `${pool.id}/${w.id}`, old = previous?.fixed.get(key)
-        const stale = old && staleWindow(old, old.index, share, now)
-        if (stale && old) fixed.set(key, old)
-        return stale ?? unavailable(w, "Не удалось проверить доступные аккаунты в CPA.")
+        if (old && reusable(old, old.index, share, windowRules(pool, w), now, windowInterval(w, now)?.end)) {
+          fixed.set(key, old)
+          return old.window
+        }
+        return unavailable(w, "Не удалось проверить доступные аккаунты в CPA.")
       })
       pools.push({ modelFamilyPrefix: pool.modelFamilyPrefix, windows })
     }
     return { view: { pools, asOf: previous?.view.asOf ?? null, issue: "unreachable" }, fixed, knownPools, spendCache }
   }
 
+  let asOf = now
   for (const { pool, share } of assigned) {
     const accountsForPool = accounts.filter(a => a.active && a.category === pool.category && (!pool.authIndex || pool.authIndex === a.index))
     if (accountsForPool.length === 0) continue
@@ -294,16 +303,18 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
     }
     const [account] = accountsForPool
     const windows: QuotaWindow[] = []
-    let revoked = false
+    let revoked = false, poolAsOf = now
     for (const w of pool.windows) {
       const key = `${pool.id}/${w.id}`, old = previous?.fixed.get(key)
       const interval = windowInterval(w, now)
       const resetAt = interval?.end
       const withReset = (window: QuotaWindow) => resetAt === undefined ? window : { ...window, resetAt }
-      const fallback = (detail: string, end?: number) => {
-        const stale = staleWindow(old, account.index, share, now, end)
-        if (stale && old) fixed.set(key, old)
-        return stale ?? withReset(unavailable(w, detail))
+      const rules = windowRules(pool, w)
+      const fallback = () => {
+        if (!reusable(old, account.index, share, rules, now, resetAt)) return
+        fixed.set(key, old)
+        poolAsOf = Math.min(poolAsOf, old.asOf)
+        return old.window
       }
       if (pool.meter.source === "serverSummary") { windows.push(withReset(unavailable(w, "Для этого источника ещё нет серверного адаптера."))); continue }
       if (!interval) {
@@ -311,10 +322,21 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
         continue
       }
       try {
-        const estimate = await spend(api, account.index, interval, pool.meter, previous?.spendCache.get(key))
-        if (estimate === undefined || estimate === "coverage") {
-          windows.push(withReset(unavailable(w, estimate === "coverage" ? "Не подтверждено, что журнал CPA покрывает всё окно." :
-            "Не удалось сверить журнал начислений с данными аккаунта.", "partial")))
+        const cached = previous?.spendCache.get(key)
+        let estimate = await spend(api, account.index, interval, pool.meter, cached)
+        if (typeof estimate === "string" && estimate !== "coverage") {
+          log?.({ check: estimate, action: "retry", windowSeconds: w.seconds })
+          estimate = await spend(api, account.index, interval, pool.meter, cached)
+        }
+        if (typeof estimate === "string") {
+          if (estimate === "coverage") {
+            windows.push(withReset(unavailable(w, "Не подтверждено, что журнал CPA покрывает всё окно.", "partial")))
+          } else {
+            const last = fallback()
+            if (last && cached) spendCache.set(key, cached)
+            log?.({ check: estimate, action: last ? "keep-last" : "unavailable", windowSeconds: w.seconds })
+            windows.push(last ?? withReset(unavailable(w, "Не удалось сверить журнал начислений с данными аккаунта.", "partial")))
+          }
           continue
         }
         const { used, skipped, cache } = estimate
@@ -333,11 +355,16 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
           validUntil: interval.end ?? now + 6 * MINUTE,
         })
         windows.push(window)
-        if (interval.end !== undefined) fixed.set(key, { share, index: account.index, window, end: interval.end, asOf: now })
+        if (interval.end !== undefined) fixed.set(key, { share, index: account.index, rules, window, end: interval.end, asOf: now })
       } catch (error) {
         if (error instanceof CpaError && error.status === 401) throw error
-        if (error instanceof CpaError && [403, 404].includes(error.status) && error.route === "/usage/models") { revoked = true; break }
-        windows.push(fallback("Не удалось прочитать расход в CPA.", interval.end))
+        if (error instanceof CpaError && (error.status === 403 || (error.status === 404 && error.route === "/usage/models"))) { revoked = true; break }
+        const last = fallback()
+        if (last) {
+          const cached = previous?.spendCache.get(key)
+          if (cached) spendCache.set(key, cached)
+        }
+        windows.push(last ?? withReset(unavailable(w, "Не удалось прочитать расход в CPA.")))
       }
     }
     if (revoked) {
@@ -347,8 +374,9 @@ export async function measure(api: CpaApi, policy: Policy, now: number, previous
       }
       continue
     }
+    asOf = Math.min(asOf, poolAsOf)
     knownPools.add(pool.id)
     pools.push({ modelFamilyPrefix: pool.modelFamilyPrefix, windows })
   }
-  return { view: { pools, asOf: now }, fixed, knownPools, spendCache }
+  return { view: { pools, asOf }, fixed, knownPools, spendCache }
 }

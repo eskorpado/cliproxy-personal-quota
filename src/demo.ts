@@ -8,7 +8,7 @@ export const scenarios = {
   over: "Перерасход Codex",
   partial: "Часть расхода не оценена",
   missing: "Нет начала недели Z.ai",
-  stale: "Устаревшие данные",
+  stale: "Сбой обновления",
   empty: "Нет доступных квот",
 } as const
 
@@ -55,7 +55,7 @@ export function demoSnapshot(scenario: Scenario, readAt = new Date()) {
     })
     return { modelFamilyPrefix: pool.modelFamilyPrefix, windows }
   })
-  return { pools, stale, asOf, readAt }
+  return { pools, asOf, readAt }
 }
 
 export type Snapshot = ReturnType<typeof demoSnapshot>
@@ -77,18 +77,17 @@ export function poolForFamily<T extends { modelFamilyPrefix: string }>(pools: T[
 export function indicator(data: Snapshot | LiveSnapshot, family?: string) {
   const pool = poolForFamily(data.pools, family)
   if (!pool) return undefined
-  const demo = "stale" in data
-  const stale = demo ? data.stale : pool.windows.some(w => w.staleAsOf !== undefined)
+  const demo = "readAt" in data
   const asOf = demo ? data.asOf : data.asOf !== null ? new Date(data.asOf) : undefined
   const prefix = pool.modelFamilyPrefix.toUpperCase()
   const parts = pool.windows.map(w => {
     const value = w.status === "over" ? "0% · превышена" : w.status === "partial" ? w.pct === null ? "неполно" : `≤${Math.ceil(w.pct)}%` : w.pct === null ? "нет данных" : `≈${Math.round(w.pct)}%`
     return `${w.title}: ${value}`
   })
-  const tone = stale || (!demo && data.issue) ? "warning" : pool.windows.some(w => w.status === "over") ? "danger" : pool.windows.some(w => w.status === "partial" || w.pct === null || w.pct <= 25) ? "warning" : "success"
+  const tone = (!demo && data.issue) ? "warning" : pool.windows.some(w => w.status === "over") ? "danger" : pool.windows.some(w => w.status === "partial" || w.pct === null || w.pct <= 25) ? "warning" : "success"
   return {
-    label: [prefix, ...parts, ...(stale ? ["устарело"] : []), ...(demo ? ["демо"] : [])].join(" · "),
-    title: `${prefix} — остаток квоты.${asOf ? ` Снимок: ${formatTime(asOf)}.` : ""}${stale ? " Есть устаревшие окна." : ""}${pool.windows.some(w => w.status === "partial") ? " Есть неполные данные." : ""}${demo ? " Демоданные" : ""}`,
+    label: [prefix, ...parts, ...(demo ? ["демо"] : [])].join(" · "),
+    title: `${prefix} — остаток квоты.${asOf ? ` Снимок: ${formatTime(asOf)}.` : ""}${pool.windows.some(w => w.status === "partial") ? " Есть неполные данные." : ""}${demo ? " Демоданные" : ""}`,
     tone: tone as "success" | "warning" | "danger",
   }
 }

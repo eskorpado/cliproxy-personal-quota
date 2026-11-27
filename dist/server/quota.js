@@ -127,18 +127,18 @@ async function readSlices(api, index, interval, meter, expected, ids, now) {
         return [];
     const expectedCount = [...expected.values()].reduce((n, row) => n + row.requests, 0);
     if (!requestCount(expectedCount))
-        return;
+        return "invalid-request-count";
     const range = rangeQuery(interval), query = { ...range, auth_index: index };
     const head = data(await api("/events", { ...range, limit: "1" }));
     const snapshot = head.snapshot_id;
     const options = record(head.filter_options)?.credential_options;
     if (typeof snapshot !== "string" || !/^\d{1,19}$/.test(snapshot) || !Array.isArray(options) || options.length > 64)
-        return;
+        return "invalid-journal-snapshot";
     const initialCount = ids.size, matched = new Map(), credentials = new Set(), days = new Map();
     for (const raw of options) {
         const option = record(raw), token = option?.value;
         if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token) || credentials.has(token))
-            return;
+            return "invalid-credential-filter";
         credentials.add(token);
         // Tokens represent credential names, not auth indices. Use the intersection with
         // this account, and reject a name collision instead of merging histories.
@@ -155,7 +155,7 @@ async function readSlices(api, index, interval, meter, expected, ids, now) {
         if (!count)
             continue;
         if (count !== option?.count || count > expectedCount - (ids.size - initialCount))
-            return;
+            return "credential-count-mismatch";
         const seen = new Map();
         // All pages use the same snapshot. Bound concurrent reads instead of
         // rejecting an entire window because its journal has many events.
@@ -166,15 +166,15 @@ async function readSlices(api, index, interval, meter, expected, ids, now) {
             }))));
             for (const [i, page] of pages.entries()) {
                 if (page.snapshot_id !== snapshot || page.total !== count || !Array.isArray(page.entries) || page.entries.length !== Math.min(PAGE_SIZE, count - offsets[i]))
-                    return;
+                    return "journal-page-mismatch";
                 for (const raw of page.entries) {
                     const event = record(raw), id = event?.id;
                     if (!event || typeof id !== "string" || !/^\d{1,19}$/.test(id) || ids.has(id))
-                        return;
+                        return "invalid-or-duplicate-event-id";
                     ids.add(id);
                     const at = utc(event.at), model = event.billing_model || event.upstream_model, cost = record(event.cost);
                     if (!(at >= interval.from && at < interval.to) || typeof model !== "string" || !cost || !nonnegative(cost.total))
-                        return;
+                        return "invalid-journal-event";
                     // Even events without comparable prices must reconcile against the account.
                     merge(seen, model, 1, cost.total);
                     const day = dayStart(at);
@@ -193,11 +193,11 @@ async function readSlices(api, index, interval, meter, expected, ids, now) {
             }
         }
         if (!equal(intersection, seen))
-            return;
+            return "credential-totals-mismatch";
         addTotals(matched, seen);
     }
     if (!equal(expected, matched))
-        return;
+        return "journal-totals-mismatch";
     return [...days.values()].sort((a, b) => a.from - b.from);
 }
 async function spend(api, index, interval, meter, previous) {
@@ -239,14 +239,14 @@ async function spend(api, index, interval, meter, previous) {
             const current = checks[i];
             addTotals(totals, current);
             const slices = cached && equal(cached.totals, current) ? [cached] : await readSlices(api, index, range, meter, current, ids, interval.to);
-            if (!slices)
-                return;
+            if (typeof slices === "string")
+                return slices;
             for (const slice of slices)
                 appendSlice(cache.slices, slice);
         }
     }
     if (!equal(expected, totals))
-        return;
+        return "interval-totals-mismatch";
     const reconciled = new Map();
     let used = 0, skipped = 0;
     for (const slice of cache.slices) {
@@ -256,14 +256,18 @@ async function spend(api, index, interval, meter, previous) {
     }
     const count = [...expected.values()].reduce((sum, row) => sum + row.requests, 0);
     if (!equal(expected, reconciled) || !Number.isFinite(used) || !requestCount(count))
-        return;
+        return "reconciled-totals-mismatch";
     return { used: skipped === count ? null : used, skipped, cache };
 }
-function staleWindow(previous, index, share, now, end) {
-    if (previous && previous.index === index && previous.share === share && previous.end > now && (end === undefined || end === previous.end))
-        return { ...previous.window, staleAsOf: previous.asOf };
+function windowRules(pool, window) {
+    const { meter } = pool;
+    return JSON.stringify([pool.modelFamilyPrefix, pool.category, pool.authIndex, window, meter,
+        meter.source === "cpa.cost" && [...meter.models].sort()]);
 }
-export async function measure(api, policy, now, previous) {
+function reusable(previous, index, share, rules, now, end) {
+    return !!previous && previous.index === index && previous.share === share && previous.rules === rules && previous.end > now && end === previous.end;
+}
+export async function measure(api, policy, now, previous, log) {
     const profile = data(await api("/profile"));
     if (profile.tracked === false)
         throw new CpaError(401);
@@ -294,15 +298,17 @@ export async function measure(api, policy, now, previous) {
             knownPools.add(pool.id);
             const windows = pool.windows.map(w => {
                 const key = `${pool.id}/${w.id}`, old = previous?.fixed.get(key);
-                const stale = old && staleWindow(old, old.index, share, now);
-                if (stale && old)
+                if (old && reusable(old, old.index, share, windowRules(pool, w), now, windowInterval(w, now)?.end)) {
                     fixed.set(key, old);
-                return stale ?? unavailable(w, "Не удалось проверить доступные аккаунты в CPA.");
+                    return old.window;
+                }
+                return unavailable(w, "Не удалось проверить доступные аккаунты в CPA.");
             });
             pools.push({ modelFamilyPrefix: pool.modelFamilyPrefix, windows });
         }
         return { view: { pools, asOf: previous?.view.asOf ?? null, issue: "unreachable" }, fixed, knownPools, spendCache };
     }
+    let asOf = now;
     for (const { pool, share } of assigned) {
         const accountsForPool = accounts.filter(a => a.active && a.category === pool.category && (!pool.authIndex || pool.authIndex === a.index));
         if (accountsForPool.length === 0)
@@ -314,17 +320,19 @@ export async function measure(api, policy, now, previous) {
         }
         const [account] = accountsForPool;
         const windows = [];
-        let revoked = false;
+        let revoked = false, poolAsOf = now;
         for (const w of pool.windows) {
             const key = `${pool.id}/${w.id}`, old = previous?.fixed.get(key);
             const interval = windowInterval(w, now);
             const resetAt = interval?.end;
             const withReset = (window) => resetAt === undefined ? window : { ...window, resetAt };
-            const fallback = (detail, end) => {
-                const stale = staleWindow(old, account.index, share, now, end);
-                if (stale && old)
-                    fixed.set(key, old);
-                return stale ?? withReset(unavailable(w, detail));
+            const rules = windowRules(pool, w);
+            const fallback = () => {
+                if (!reusable(old, account.index, share, rules, now, resetAt))
+                    return;
+                fixed.set(key, old);
+                poolAsOf = Math.min(poolAsOf, old.asOf);
+                return old.window;
             };
             if (pool.meter.source === "serverSummary") {
                 windows.push(withReset(unavailable(w, "Для этого источника ещё нет серверного адаптера.")));
@@ -335,10 +343,23 @@ export async function measure(api, policy, now, previous) {
                 continue;
             }
             try {
-                const estimate = await spend(api, account.index, interval, pool.meter, previous?.spendCache.get(key));
-                if (estimate === undefined || estimate === "coverage") {
-                    windows.push(withReset(unavailable(w, estimate === "coverage" ? "Не подтверждено, что журнал CPA покрывает всё окно." :
-                        "Не удалось сверить журнал начислений с данными аккаунта.", "partial")));
+                const cached = previous?.spendCache.get(key);
+                let estimate = await spend(api, account.index, interval, pool.meter, cached);
+                if (typeof estimate === "string" && estimate !== "coverage") {
+                    log?.({ check: estimate, action: "retry", windowSeconds: w.seconds });
+                    estimate = await spend(api, account.index, interval, pool.meter, cached);
+                }
+                if (typeof estimate === "string") {
+                    if (estimate === "coverage") {
+                        windows.push(withReset(unavailable(w, "Не подтверждено, что журнал CPA покрывает всё окно.", "partial")));
+                    }
+                    else {
+                        const last = fallback();
+                        if (last && cached)
+                            spendCache.set(key, cached);
+                        log?.({ check: estimate, action: last ? "keep-last" : "unavailable", windowSeconds: w.seconds });
+                        windows.push(last ?? withReset(unavailable(w, "Не удалось сверить журнал начислений с данными аккаунта.", "partial")));
+                    }
                     continue;
                 }
                 const { used, skipped, cache } = estimate;
@@ -361,16 +382,22 @@ export async function measure(api, policy, now, previous) {
                 });
                 windows.push(window);
                 if (interval.end !== undefined)
-                    fixed.set(key, { share, index: account.index, window, end: interval.end, asOf: now });
+                    fixed.set(key, { share, index: account.index, rules, window, end: interval.end, asOf: now });
             }
             catch (error) {
                 if (error instanceof CpaError && error.status === 401)
                     throw error;
-                if (error instanceof CpaError && [403, 404].includes(error.status) && error.route === "/usage/models") {
+                if (error instanceof CpaError && (error.status === 403 || (error.status === 404 && error.route === "/usage/models"))) {
                     revoked = true;
                     break;
                 }
-                windows.push(fallback("Не удалось прочитать расход в CPA.", interval.end));
+                const last = fallback();
+                if (last) {
+                    const cached = previous?.spendCache.get(key);
+                    if (cached)
+                        spendCache.set(key, cached);
+                }
+                windows.push(last ?? withReset(unavailable(w, "Не удалось прочитать расход в CPA.")));
             }
         }
         if (revoked) {
@@ -380,8 +407,9 @@ export async function measure(api, policy, now, previous) {
             }
             continue;
         }
+        asOf = Math.min(asOf, poolAsOf);
         knownPools.add(pool.id);
         pools.push({ modelFamilyPrefix: pool.modelFamilyPrefix, windows });
     }
-    return { view: { pools, asOf: now }, fixed, knownPools, spendCache };
+    return { view: { pools, asOf }, fixed, knownPools, spendCache };
 }

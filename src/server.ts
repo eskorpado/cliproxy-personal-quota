@@ -1,8 +1,21 @@
 import { Plugin } from "@opencode/plugin"
+import { appendFile, mkdir } from "node:fs/promises"
+import { homedir } from "node:os"
+import { isAbsolute, join } from "node:path"
 import { CpaClient } from "./cpa.ts"
 import { liveQuota } from "./live.ts"
 import { QuotaRpc } from "./rpc.ts"
 import { configuredTarget, matchesOrigin } from "./target.ts"
+import type { ReconciliationLog } from "./quota.ts"
+
+const logReconciliation: ReconciliationLog = event => {
+  const stateHome = process.env.XDG_STATE_HOME
+  const directory = join(stateHome && isAbsolute(stateHome) ? stateHome : join(homedir(), ".local", "state"), "opencode", "cliproxy-personal-quota")
+  const line = `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`
+  void mkdir(directory, { recursive: true, mode: 0o700 })
+    .then(() => appendFile(join(directory, "reconciliation.log"), line, { mode: 0o600 }))
+    .catch(() => console.warn(`[cliproxy-personal-quota] CPA reconciliation ${line.trimEnd()}`))
+}
 
 export default Plugin.define({
   id: "cliproxy-personal-quota",
@@ -20,7 +33,7 @@ export default Plugin.define({
         if (credential?.type === "key") key = credential.key
       }
       return typeof key === "string" && key.length <= 1024 && /^[\x21-\x7e]+$/.test(key) ? { key } : { issue: "key" }
-    }, new CpaClient(target.origin))
+    }, new CpaClient(target.origin), Date.now, logReconciliation)
     const registration = await ctx.rpc.register(QuotaRpc, {
       snapshot: async (input, { signal }) => live?.snapshot(signal, (input as { revalidate?: boolean }).revalidate === true) ?? { pools: [], asOf: null, issue: "provider" },
     })

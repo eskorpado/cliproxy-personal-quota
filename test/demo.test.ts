@@ -41,7 +41,8 @@ test("Повторное чтение устаревших данных не в�
   assert.equal(first.asOf.getTime(), next.asOf.getTime())
   assert.ok(first.asOf < first.readAt)
   assert.equal(first.pools[0].windows[0].resetAt, next.pools[0].windows[0].resetAt)
-  assert.match(indicator(next, "glm-flash")!.label, /устарело/)
+  assert.deepEqual(indicator(next, "glm-flash"), indicator(first, "glm-flash"))
+  assert.doesNotMatch(JSON.stringify(indicator(next, "glm-flash")), /устарел/i)
 })
 
 test("В демо показан отсчёт до известной границы, а не срок годности снимка", () => {

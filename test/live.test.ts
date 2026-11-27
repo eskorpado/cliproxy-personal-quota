@@ -4,7 +4,7 @@ import example from "../quota-policy.example.json" with { type: "json" }
 import { CpaClient } from "../src/cpa.ts"
 import { liveQuota, type Identity } from "../src/live.ts"
 import { allocation, parsePolicy, type PoolPolicy } from "../src/policy.ts"
-import { eventSpend, measure, windowInterval } from "../src/quota.ts"
+import { eventSpend, measure, windowInterval, type ReconciliationLog } from "../src/quota.ts"
 import { configuredTarget, matchesOrigin } from "../src/target.ts"
 import { currentView } from "../src/view.ts"
 
@@ -42,10 +42,11 @@ function codexPolicy(coverage?: { fromUtc?: string; retentionDays?: number }) {
   }] }
 }
 
-function stub() {
+function stub(log?: ReconciliationLog) {
   let now = at, label = "test user quota=20", expectedKey = fixtureKey, files = [account]
   let usageCode = 200, profileCode = 200, inventoryCode = 200, catalogCode = 200
   let events: EventFixture[] = [baseEvent], journal: EventFixture[] | undefined, credentialCount: number | undefined
+  let nextCredentialCount: number | undefined
   let catalogue: unknown = codexPolicy()
   const reset = at + hour
   const calls: { path: string; query: URLSearchParams; etag: string | null }[] = []
@@ -93,13 +94,15 @@ function stub() {
           const entries = journal ?? inRange
           return Response.json({ snapshot_id: "81", total: entries.length, entries: entries.slice(offset, offset + size) })
         }
-        return Response.json({ snapshot_id: "81", filter_options: { credential_options: [{ value: unrelated, count: 3 }, { value: token, count: credentialCount ?? inRange.length }] } })
+        const count = nextCredentialCount ?? credentialCount ?? inRange.length
+        nextCredentialCount = undefined
+        return Response.json({ snapshot_id: "81", filter_options: { credential_options: [{ value: unrelated, count: 3 }, { value: token, count }] } })
       default: throw new Error(`Unexpected test route ${path}`)
     }
   }
   const clock = () => now
   let identity: Identity = { key: fixtureKey }
-  const live = liveQuota(async () => identity, new CpaClient(origin, fetcher, clock), clock)
+  const live = liveQuota(async () => identity, new CpaClient(origin, fetcher, clock), clock, log)
   return {
     calls, snapshot: (revalidate = false) => live.snapshot(new AbortController().signal, revalidate),
     label: (s: string) => { label = s }, now: (n: number) => { now = n }, files: (v: typeof files) => { files = v },
@@ -108,6 +111,7 @@ function stub() {
     catalog: (v: unknown, code = 200) => { catalogue = v; catalogCode = code },
     identity: (v: Identity) => { identity = v; if ("key" in v) expectedKey = v.key },
     count: (n: number) => { credentialCount = n },
+    nextCount: (n: number) => { nextCredentialCount = n },
     journal: (v: EventFixture[]) => { journal = v },
     events: (v: EventFixture[]) => { events = v; journal = undefined; credentialCount = undefined },
     empty: () => { events = []; journal = undefined; credentialCount = undefined },
@@ -225,7 +229,7 @@ test("published legacy resetUtc is reused after multiple cycles without carrying
   s.now(start + length + hour)
   const missing = (await s.snapshot()).pools[0].windows[0]
   assert.equal(missing.pct, null)
-  assert.equal(missing.staleAsOf, undefined)
+  assert.doesNotMatch(JSON.stringify(missing), /staleAsOf/)
   assert.equal(missing.resetAt, start + 2 * length)
 })
 
@@ -325,6 +329,7 @@ test("a weekly journal above 10,000 events is fully reconciled across page batch
   // After the cache expires, matching totals cannot hide an ID repeated in a later batch.
   s.journal([...events.slice(0, -1), { ...events.at(-1)!, id: events[0].id }])
   s.now(at + 30 * 60_000)
+  s.identity({ key: "second-synthetic-key" })
   const duplicate = await window()
   assert.equal(duplicate.pct, null)
   assert.match(duplicate.detail!, /Не удалось сверить журнал/)
@@ -388,6 +393,7 @@ test("event pages are pinned; account collisions and coverage gaps don't invent 
   assert.deepEqual(s.calls.filter(c => c.query.has("credential")).map(c => c.query.get("offset")), ["0", "250"])
   s.count(256)
   s.now(at + 30 * 60_000)
+  s.identity({ key: "second-synthetic-key" })
   const mismatch = (await s.snapshot()).pools[0].windows[0]
   assert.equal(mismatch.status, "partial")
   assert.equal(mismatch.pct, null)
@@ -428,14 +434,13 @@ test("manual refresh picks up a published catalog immediately within its five-mi
   assert.deepEqual(s.calls.filter(c => c.path.startsWith("/.well-known")).map(c => c.etag), [null, '"catalog"'])
 })
 
-test("only transient failures within a fixed cycle may show stale data; loss of access clears it", async () => {
+test("transient failures keep the last fixed-window figure without marking it; loss of access clears it", async () => {
   const s = stub()
   const first = await s.snapshot()
   s.now(at + 60_000)
   s.usage(502)
-  const stale = (await s.snapshot()).pools[0].windows[0]
-  assert.equal(stale.staleAsOf, at)
-  assert.equal(stale.resetAt, at + hour)
+  const fallback = await s.snapshot()
+  assert.deepEqual(fallback, first)
   s.inventory(502)
   assert.equal((await s.snapshot()).pools[0].windows[0].pct, 70)
   const expired = currentView(first, at + hour).pools[0].windows[0]
@@ -451,6 +456,34 @@ test("only transient failures within a fixed cycle may show stale data; loss of 
   assert.equal((await s.snapshot()).pools[0].windows[0].pct, null)
   s.files([])
   assert.deepEqual((await s.snapshot()).pools, [])
+})
+
+test("a journal mismatch retries once, then keeps the same window without a UI marker", async () => {
+  const logs: Parameters<ReconciliationLog>[0][] = []
+  const s = stub(event => logs.push(event))
+  s.nextCount(2)
+  const first = await s.snapshot()
+  assert.equal(first.pools[0].windows[0].pct, 70)
+  assert.deepEqual(logs.splice(0), [{ check: "credential-count-mismatch", action: "retry", windowSeconds: 604800 }])
+
+  const later = { ...baseEvent, id: "79", at: new Date(at + 1).toISOString() }
+  s.events([baseEvent, later])
+  s.now(at + 60_000)
+  s.count(2)
+  s.catalog({ ...codexPolicy(), revision: "next" })
+  assert.deepEqual(await s.snapshot(true), first)
+  assert.deepEqual(logs.map(event => event.action), ["retry", "keep-last"])
+
+  const changed = structuredClone(codexPolicy())
+  changed.pools[0].windows[0].capacity = 200
+  s.catalog(changed)
+  const noFallback = (await s.snapshot(true)).pools[0].windows[0]
+  assert.equal(noFallback.pct, null)
+  assert.match(noFallback.detail!, /Не удалось сверить журнал/)
+  assert.equal(logs.at(-1)?.action, "unavailable")
+
+  s.events([baseEvent, later])
+  assert.equal((await s.snapshot()).pools[0].windows[0].pct, 70)
 })
 
 test("account ambiguity, confirmed removal and a failed inventory are distinct", async () => {

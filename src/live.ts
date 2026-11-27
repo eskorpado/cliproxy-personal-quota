@@ -1,17 +1,16 @@
 import { CpaError, type CpaClient } from "./cpa.ts"
-import { measure, type MeteredSnapshot } from "./quota.ts"
+import { measure, type MeteredSnapshot, type ReconciliationLog } from "./quota.ts"
 import { currentView, type Issue, type LiveSnapshot } from "./view.ts"
-import type { Policy } from "./policy.ts"
 
 export type Identity = { key: string } | { issue: "provider" | "key" }
 type CachedKey = {
-  key: string; policy?: Policy; previous?: MeteredSnapshot
+  key: string; previous?: MeteredSnapshot
   work?: Promise<LiveSnapshot>; controller: AbortController
 }
 
 const empty = (issue: Issue): LiveSnapshot => ({ pools: [], asOf: null, issue })
 
-export function liveQuota(resolveIdentity: () => Promise<Identity>, cpa: CpaClient, clock = Date.now) {
+export function liveQuota(resolveIdentity: () => Promise<Identity>, cpa: CpaClient, clock = Date.now, log?: ReconciliationLog) {
   let active: CachedKey | undefined
   let disposed = false
 
@@ -25,13 +24,8 @@ export function liveQuota(resolveIdentity: () => Promise<Identity>, cpa: CpaClie
     try {
       const { value: policy, issue } = await cpa.policy(signal, revalidate)
       if (!policy) return empty(issue ?? "catalog-unreachable")
-      // Don't reuse percentages across pricing/cycle policy changes.
-      if (state.policy !== policy && state.previous) {
-        state.previous = { view: { pools: [], asOf: null }, fixed: new Map(), knownPools: new Set(), spendCache: state.previous.spendCache }
-      }
-      state.policy = policy
-      const next = await measure(cpa.api(state.key, signal), policy, clock(), state.previous)
-      signal.throwIfAborted()
+      const next = await measure(cpa.api(state.key, signal), policy, clock(), state.previous, log)
+      state.controller.signal.throwIfAborted()
       state.previous = next
       return { ...next.view, ...(issue ? { issue } : {}) }
     } catch (error) {
